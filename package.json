@@ -1,6 +1,6 @@
 {
   "name": "linuxdo-tool-v2",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "private": true,
   "description": "Userscript for linux.do and Discourse forums with export, filtering, and auto-read tools.",
   "author": "MoMo",
