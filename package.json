@@ -1,0 +1,44 @@
+{
+  "name": "linuxdo-tool-v2",
+  "version": "0.1.12",
+  "private": true,
+  "description": "Userscript for linux.do and Discourse forums with export, filtering, and auto-read tools.",
+  "author": "MoMo",
+  "keywords": [
+    "userscript",
+    "tampermonkey",
+    "violentmonkey",
+    "discourse",
+    "linuxdo"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "BUILD=dev tsup && node scripts/postbuild.mjs dev",
+    "build": "BUILD=prod tsup && node scripts/postbuild.mjs prod",
+    "size": "node scripts/check-size.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "biome lint .",
+    "format": "biome format . --write",
+    "test": "vitest run"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leonardkorir/Tool.git"
+  },
+  "homepage": "https://github.com/leonardkorir/Tool",
+  "bugs": {
+    "url": "https://github.com/leonardkorir/Tool/issues"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.13",
+    "@types/node": "^22.13.1",
+    "@types/tampermonkey": "^5.0.5",
+    "linkedom": "^0.18.12",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  }
+}

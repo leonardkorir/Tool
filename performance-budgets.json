@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "file": "dist/linuxdo-tool.user.js",
+    "maxBytes": 256000,
+    "maxGzipBytes": 81920
+  }
+}
