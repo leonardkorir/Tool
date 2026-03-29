@@ -15,5 +15,8 @@ export default defineConfig(() => {
     splitting: false,
     clean: false,
     treeshake: true,
+    esbuildOptions(options) {
+      if (!isDev) options.drop = ['console', 'debugger']
+    },
   }
 })

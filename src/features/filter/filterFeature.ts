@@ -12,7 +12,16 @@ import {
 import { loadCachedTaxonomy, refreshTaxonomy } from '../../platform/discourse/taxonomy'
 import { tryGetTopicJsonFromDataPreloaded } from '../../platform/discourse/preloaded'
 import type { FilterConfig, FilterMode, Level, TopicMeta } from './rules'
+import {
+  buildHomeSourceRequests,
+  filterHomeSourceTopicsByRequest,
+  normalizeHomeSourceTopics,
+  selectHomeSourceTopics,
+  type HomeSourceTopic,
+  type TopicListResponseJson,
+} from './homeSource'
 import { shouldShowTopic } from './rules'
+import { canonicalTagKey, canonicalTagName, isNoTagToken } from './tagTokens'
 
 const FEATURE_ID = 'ld2-filter'
 const TAXONOMY_TTL_MS = 24 * 60 * 60 * 1000
@@ -26,10 +35,16 @@ const KEY_TAGS_INC = 'filter.tagsInclude'
 const KEY_TAGS_EX = 'filter.tagsExclude'
 const KEY_CUSTOM_CATS = 'filter.customCategories'
 const KEY_CUSTOM_TAGS = 'filter.customTags'
+const KEY_HOME_SOURCE_ENABLED = 'filter.homeSourceEnabled'
+const KEY_HOME_SOURCE_CATS = 'filter.homeSourceCategories'
+const KEY_HOME_SOURCE_TAGS = 'filter.homeSourceTags'
+const KEY_HOME_SOURCE_COLLAPSED = 'filter.homeSourceCollapsedByDefault'
+const KEY_HOME_SOURCE_PANEL_EXPANDED = 'filter.homeSourcePanelExpanded'
 const KEY_BLOCKED_USERS = 'filter.blockedUsers'
 const KEY_SHOW_BLOCKED_POSTS = 'filter.showBlockedPostsInTopic'
 const KEY_AUTO_LOAD = 'filter.autoLoadMore'
 const BLOCKED_POST_REVEAL_MS = 2 * 60_000
+const HOME_SOURCE_LIMIT = 24
 
 type TriState = 'neutral' | 'include' | 'exclude'
 
@@ -74,6 +89,49 @@ function parseUsernameFromHref(rawHref: string): string | null {
   }
 }
 
+function parseTopicIdFromHref(rawHref: string): number | null {
+  const href = String(rawHref || '').trim()
+  if (!href) return null
+  try {
+    const url = new URL(href, window.location.origin)
+    const match =
+      url.pathname.match(/^\/t\/(\d+)(?:\/\d+)?(?:\/)?$/) ??
+      url.pathname.match(/^\/t\/[^/]+\/(\d+)(?:\/\d+)?(?:\/)?$/)
+    if (!match?.[1]) return null
+    const id = Number.parseInt(match[1], 10)
+    return Number.isFinite(id) && id > 0 ? id : null
+  } catch {
+    return null
+  }
+}
+
+function parseCategoryIdFromHref(rawHref: string): number | null {
+  const href = String(rawHref || '').trim()
+  if (!href) return null
+  try {
+    const url = new URL(href, window.location.origin)
+    const parts = url.pathname.split('/').filter(Boolean)
+    if (parts[0] !== 'c') return null
+    const last = Number.parseInt(parts[parts.length - 1] || '', 10)
+    return Number.isFinite(last) && last > 0 ? last : null
+  } catch {
+    return null
+  }
+}
+
+function parseTagNameFromHref(rawHref: string): string | null {
+  const href = String(rawHref || '').trim()
+  if (!href) return null
+  try {
+    const url = new URL(href, window.location.origin)
+    const parts = url.pathname.split('/').filter(Boolean)
+    if (parts[0] !== 'tag' || !parts[1]) return null
+    return decodeURIComponent(parts[1]).trim() || null
+  } catch {
+    return null
+  }
+}
+
 function normalizeBlockedUserInput(raw: string): string | null {
   const value = String(raw || '').trim()
   if (!value) return null
@@ -85,23 +143,6 @@ function normalizeBlockedUserInput(raw: string): string | null {
 
 function toBlockedUserSet(users: string[]): Set<string> {
   return new Set(users.map((u) => normalizeUsername(u)).filter(Boolean))
-}
-
-function isNoTagToken(raw: string): boolean {
-  const value = String(raw ?? '').trim().toLowerCase()
-  return value === '无标签' || value === 'no_tag' || value === '__no_tag__'
-}
-
-function canonicalTagKey(raw: string): string {
-  const value = String(raw ?? '').trim()
-  if (!value) return ''
-  return (isNoTagToken(value) ? '无标签' : value).trim().toLowerCase()
-}
-
-function canonicalTagName(raw: string): string {
-  const value = String(raw ?? '').trim()
-  if (!value) return ''
-  return (isNoTagToken(value) ? '无标签' : value).trim()
 }
 
 function getListContainer(): HTMLElement | null {
@@ -127,7 +168,8 @@ function getTopicItemFromNode(node: Node | null): HTMLElement | null {
     if (node.classList.contains('topic-list-item')) return node
     return node.closest<HTMLElement>('.topic-list-item')
   }
-  if (node instanceof Text) return node.parentElement?.closest<HTMLElement>('.topic-list-item') ?? null
+  if (node instanceof Text)
+    return node.parentElement?.closest<HTMLElement>('.topic-list-item') ?? null
   return null
 }
 
@@ -167,22 +209,34 @@ function parseLevelFromElement(el: HTMLElement): Level {
 }
 
 function parseCategoryIdFromElement(el: HTMLElement): number | null {
-  const badge = el.querySelector<HTMLElement>('[data-category-id]')
-  const id = badge?.getAttribute('data-category-id')
-  if (!id) return null
-  const n = Number.parseInt(id, 10)
-  return Number.isFinite(n) ? n : null
+  for (const node of [el, ...Array.from(el.querySelectorAll<HTMLElement>('[data-category-id]'))]) {
+    const raw = node.getAttribute?.('data-category-id') || node.dataset?.categoryId || ''
+    const n = Number.parseInt(raw, 10)
+    if (Number.isFinite(n) && n > 0) return n
+  }
+
+  const badgeLink = el.querySelector<HTMLAnchorElement>(
+    'a[href*="/c/"], .badge-category__wrapper a[href*="/c/"]'
+  )
+  return badgeLink
+    ? parseCategoryIdFromHref(badgeLink.getAttribute('href') || badgeLink.href)
+    : null
 }
 
 function parseParentCategoryIdFromElement(el: HTMLElement): number | null {
-  const badge = el.querySelector<HTMLElement>('[data-parent-category-id]')
-  const id = badge?.getAttribute('data-parent-category-id')
-  if (!id) return null
-  const n = Number.parseInt(id, 10)
-  return Number.isFinite(n) ? n : null
+  for (const node of [
+    el,
+    ...Array.from(el.querySelectorAll<HTMLElement>('[data-parent-category-id]')),
+  ]) {
+    const raw =
+      node.getAttribute?.('data-parent-category-id') || node.dataset?.parentCategoryId || ''
+    const n = Number.parseInt(raw, 10)
+    if (Number.isFinite(n) && n > 0) return n
+  }
+  return null
 }
 
-function parseTagsFromElement(el: HTMLElement): string[] {
+export function parseTagsFromElement(el: HTMLElement): string[] {
   const out = new Set<string>()
 
   // v1-compatible: Discourse topic rows usually carry `tag-xxx` classes.
@@ -200,13 +254,26 @@ function parseTagsFromElement(el: HTMLElement): string[] {
     if (t) out.add(t)
   }
 
-  // Fallback: some views render actual tag links.
-  for (const a of Array.from(el.querySelectorAll<HTMLElement>('a.discourse-tag'))) {
-    const t = (a.getAttribute('data-tag-name') || a.textContent || '').trim()
+  // Linux.do / Discourse variants can render tags as links, plain text chips, or custom spans.
+  for (const node of Array.from(
+    el.querySelectorAll<HTMLElement>('[data-tag-name], .discourse-tag, .simple-tag, a[href*="/tag/"]')
+  )) {
+    const href =
+      node.tagName === 'A'
+        ? ((node as HTMLAnchorElement).getAttribute('href') || (node as HTMLAnchorElement).href)
+        : node.getAttribute('href') || ''
+    const t =
+      (node.getAttribute('data-tag-name') || node.textContent || '').trim() ||
+      parseTagNameFromHref(href) ||
+      ''
     if (t) out.add(t)
   }
 
   return Array.from(out)
+}
+
+function parseCategoryTextFromElement(el: HTMLElement): string {
+  return getText(el.querySelector('.badge-category__wrapper, .topic-category, .category'))
 }
 
 function parseTopicAuthorFromElement(el: HTMLElement): string | null {
@@ -325,6 +392,10 @@ function isListPage(pathname: string): boolean {
   return !isUserPage(pathname) && !pathname.startsWith('/t/')
 }
 
+function isHomeFeedPage(pathname: string): boolean {
+  return pathname === '/' || pathname === '/latest'
+}
+
 function isCategoryOrTagScopedPage(pathname: string): boolean {
   return (
     /^\/c(?:\/|$)/.test(pathname) ||
@@ -341,6 +412,8 @@ function getEffectiveListFilterConfig(cfg: FilterConfig, pathname: string): Filt
     categoriesExclude: [],
     tagsInclude: [],
     tagsExclude: [],
+    homeSourceCategories: [],
+    homeSourceTags: [],
   }
 }
 
@@ -432,6 +505,78 @@ export function filterFeature(): Feature {
       tagsDetails.appendChild(tagsSearch)
       tagsDetails.appendChild(tagsList)
 
+      const homeSourceDetails = document.createElement('details')
+      homeSourceDetails.open = false
+      const homeSourceSummary = document.createElement('summary')
+      homeSourceSummary.textContent = '首页补源'
+      homeSourceDetails.appendChild(homeSourceSummary)
+      const homeSourceEnabledLabel = document.createElement('label')
+      homeSourceEnabledLabel.className = 'ld2-check-row ld2-check-row-spacious'
+      homeSourceEnabledLabel.style.display = 'flex'
+      homeSourceEnabledLabel.style.alignItems = 'center'
+      homeSourceEnabledLabel.style.gap = '8px'
+      homeSourceEnabledLabel.style.marginTop = '8px'
+      const homeSourceEnabledInput = createCheckbox()
+      homeSourceEnabledLabel.appendChild(homeSourceEnabledInput)
+      homeSourceEnabledLabel.appendChild(
+        document.createTextNode('启用首页补源（仅首页 / 与 /latest 生效）')
+      )
+      const homeSourceCollapsedLabel = document.createElement('label')
+      homeSourceCollapsedLabel.className = 'ld2-check-row ld2-check-row-spacious'
+      homeSourceCollapsedLabel.style.display = 'flex'
+      homeSourceCollapsedLabel.style.alignItems = 'center'
+      homeSourceCollapsedLabel.style.gap = '8px'
+      const homeSourceCollapsedInput = createCheckbox()
+      homeSourceCollapsedLabel.appendChild(homeSourceCollapsedInput)
+      homeSourceCollapsedLabel.appendChild(document.createTextNode('首页面板默认折叠'))
+      const homeSourceHelp = document.createElement('div')
+      homeSourceHelp.className = 'ld2-inline-help ld2-muted'
+      homeSourceHelp.style.marginTop = '8px'
+      homeSourceHelp.textContent =
+        '把指定分类或标签的最新主题主动补到首页列表；仍会继续受上面的等级、分类、标签、屏蔽用户规则约束。'
+      const homeSourceStatus = document.createElement('div')
+      homeSourceStatus.className = 'ld2-inline-help ld2-muted'
+      homeSourceStatus.style.marginTop = '8px'
+      homeSourceStatus.textContent = '未启用'
+      const homeSourceStatusMeta = document.createElement('div')
+      homeSourceStatusMeta.className = 'ld2-inline-help ld2-muted'
+      homeSourceStatusMeta.style.marginTop = '6px'
+      const homeSourceStatusList = document.createElement('div')
+      homeSourceStatusList.className = 'stack vertical'
+      homeSourceStatusList.style.marginTop = '8px'
+      const homeSourceCatsTitle = document.createElement('div')
+      homeSourceCatsTitle.className = 'ld2-section-title'
+      homeSourceCatsTitle.textContent = '补源分类'
+      homeSourceCatsTitle.style.marginTop = '10px'
+      const homeSourceCatsSearch = document.createElement('input')
+      homeSourceCatsSearch.type = 'text'
+      homeSourceCatsSearch.placeholder = '搜索分类或输入分类编号'
+      homeSourceCatsSearch.style.marginTop = '8px'
+      const homeSourceCatsList = document.createElement('div')
+      homeSourceCatsList.style.marginTop = '8px'
+      const homeSourceTagsTitle = document.createElement('div')
+      homeSourceTagsTitle.className = 'ld2-section-title'
+      homeSourceTagsTitle.textContent = '补源标签'
+      homeSourceTagsTitle.style.marginTop = '10px'
+      const homeSourceTagsSearch = document.createElement('input')
+      homeSourceTagsSearch.type = 'text'
+      homeSourceTagsSearch.placeholder = '搜索标签或输入自定义标签'
+      homeSourceTagsSearch.style.marginTop = '8px'
+      const homeSourceTagsList = document.createElement('div')
+      homeSourceTagsList.style.marginTop = '8px'
+      homeSourceDetails.appendChild(homeSourceEnabledLabel)
+      homeSourceDetails.appendChild(homeSourceCollapsedLabel)
+      homeSourceDetails.appendChild(homeSourceHelp)
+      homeSourceDetails.appendChild(homeSourceStatus)
+      homeSourceDetails.appendChild(homeSourceStatusMeta)
+      homeSourceDetails.appendChild(homeSourceStatusList)
+      homeSourceDetails.appendChild(homeSourceCatsTitle)
+      homeSourceDetails.appendChild(homeSourceCatsSearch)
+      homeSourceDetails.appendChild(homeSourceCatsList)
+      homeSourceDetails.appendChild(homeSourceTagsTitle)
+      homeSourceDetails.appendChild(homeSourceTagsSearch)
+      homeSourceDetails.appendChild(homeSourceTagsList)
+
       const blockedDetails = document.createElement('details')
       blockedDetails.open = false
       const blockedSummary = document.createElement('summary')
@@ -504,6 +649,7 @@ export function filterFeature(): Feature {
       controls.appendChild(levelsWrap)
       controls.appendChild(catsDetails)
       controls.appendChild(tagsDetails)
+      controls.appendChild(homeSourceDetails)
       controls.appendChild(blockedDetails)
       controls.appendChild(autoLoadLabel)
       const miscRow = document.createElement('div')
@@ -518,6 +664,10 @@ export function filterFeature(): Feature {
         autoLoadInput.disabled = disabled
         catsSearch.disabled = disabled
         tagsSearch.disabled = disabled
+        homeSourceEnabledInput.disabled = disabled
+        homeSourceCollapsedInput.disabled = disabled
+        homeSourceCatsSearch.disabled = disabled
+        homeSourceTagsSearch.disabled = disabled
         blockedInput.disabled = disabled
         blockedAddBtn.disabled = disabled
         showBlockedPostsInput.disabled = disabled
@@ -537,6 +687,10 @@ export function filterFeature(): Feature {
         const categoriesExclude = ctx.storage.get(KEY_CATS_EX, [] as number[])
         const tagsInclude = ctx.storage.get(KEY_TAGS_INC, [] as string[])
         const tagsExclude = ctx.storage.get(KEY_TAGS_EX, [] as string[])
+        const homeSourceEnabled = ctx.storage.get(KEY_HOME_SOURCE_ENABLED, false)
+        const homeSourceCategories = ctx.storage.get(KEY_HOME_SOURCE_CATS, [] as number[])
+        const homeSourceTags = ctx.storage.get(KEY_HOME_SOURCE_TAGS, [] as string[])
+        const homeSourceCollapsedByDefault = ctx.storage.get(KEY_HOME_SOURCE_COLLAPSED, true)
         const blockedUsers = ctx.storage.get(KEY_BLOCKED_USERS, [] as string[])
         const showBlockedPostsInTopic = ctx.storage.get(KEY_SHOW_BLOCKED_POSTS, false)
         const autoLoadMore = ctx.storage.get(KEY_AUTO_LOAD, false)
@@ -555,6 +709,12 @@ export function filterFeature(): Feature {
             : [],
           tagsInclude: Array.isArray(tagsInclude) ? uniqCaseInsensitive(tagsInclude) : [],
           tagsExclude: Array.isArray(tagsExclude) ? uniqCaseInsensitive(tagsExclude) : [],
+          homeSourceEnabled: !!homeSourceEnabled,
+          homeSourceCategories: Array.isArray(homeSourceCategories)
+            ? homeSourceCategories.filter((n) => Number.isFinite(n))
+            : [],
+          homeSourceTags: Array.isArray(homeSourceTags) ? uniqCaseInsensitive(homeSourceTags) : [],
+          homeSourceCollapsedByDefault: !!homeSourceCollapsedByDefault,
           blockedUsers: Array.isArray(blockedUsers)
             ? uniqCaseInsensitive(
                 blockedUsers.map((u) => normalizeBlockedUserInput(String(u) || '') || '')
@@ -573,6 +733,10 @@ export function filterFeature(): Feature {
         ctx.storage.set(KEY_CATS_EX, cfg.categoriesExclude)
         ctx.storage.set(KEY_TAGS_INC, cfg.tagsInclude)
         ctx.storage.set(KEY_TAGS_EX, cfg.tagsExclude)
+        ctx.storage.set(KEY_HOME_SOURCE_ENABLED, cfg.homeSourceEnabled)
+        ctx.storage.set(KEY_HOME_SOURCE_CATS, cfg.homeSourceCategories)
+        ctx.storage.set(KEY_HOME_SOURCE_TAGS, cfg.homeSourceTags)
+        ctx.storage.set(KEY_HOME_SOURCE_COLLAPSED, cfg.homeSourceCollapsedByDefault)
         ctx.storage.set(KEY_BLOCKED_USERS, cfg.blockedUsers)
         ctx.storage.set(KEY_SHOW_BLOCKED_POSTS, cfg.showBlockedPostsInTopic)
         ctx.storage.set(KEY_AUTO_LOAD, cfg.autoLoadMore)
@@ -604,7 +768,9 @@ export function filterFeature(): Feature {
       }
 
       function rememberCustomTagNames(tags: Iterable<string>): void {
-        const next = new Map(readCustomTagNames().map((tag) => [canonicalTagKey(tag), tag] as const))
+        const next = new Map(
+          readCustomTagNames().map((tag) => [canonicalTagKey(tag), tag] as const)
+        )
         let changed = false
         for (const raw of tags) {
           const key = canonicalTagKey(raw)
@@ -623,15 +789,17 @@ export function filterFeature(): Feature {
         if (!taxonomy) return
 
         const knownCategoryIds = new Set(taxonomy.categories.map((c) => c.id))
-        const missingCategoryIds = [...cfg.categoriesInclude, ...cfg.categoriesExclude].filter(
-          (id) => !knownCategoryIds.has(id)
-        )
+        const missingCategoryIds = [
+          ...cfg.categoriesInclude,
+          ...cfg.categoriesExclude,
+          ...cfg.homeSourceCategories,
+        ].filter((id) => !knownCategoryIds.has(id))
         if (missingCategoryIds.length > 0) rememberCustomCategoryIds(missingCategoryIds)
 
         const knownTagKeys = new Set(
           taxonomy.tags.map((tag) => canonicalTagKey(String(tag.name ?? ''))).filter(Boolean)
         )
-        const missingTagNames = [...cfg.tagsInclude, ...cfg.tagsExclude]
+        const missingTagNames = [...cfg.tagsInclude, ...cfg.tagsExclude, ...cfg.homeSourceTags]
           .map((tag) => canonicalTagName(tag))
           .filter((tag) => {
             const key = canonicalTagKey(tag)
@@ -640,12 +808,112 @@ export function filterFeature(): Feature {
         if (missingTagNames.length > 0) rememberCustomTagNames(missingTagNames)
       }
 
+      let taxonomyLookupCache: {
+        updatedAt: number
+        byId: Map<
+          number,
+          {
+            id: number
+            name: string
+            parentCategoryId: number | null
+            label: string
+          }
+        >
+        byName: Map<
+          string,
+          Array<{
+            id: number
+            name: string
+            parentCategoryId: number | null
+            label: string
+          }>
+        >
+        byLabel: Map<
+          string,
+          {
+            id: number
+            name: string
+            parentCategoryId: number | null
+            label: string
+          }
+        >
+      } | null = null
+
+      function getTaxonomyLookup() {
+        const taxonomy = loadCachedTaxonomy(ctx.storage)
+        if (!taxonomy) {
+          taxonomyLookupCache = null
+          return null
+        }
+        if (taxonomyLookupCache && taxonomyLookupCache.updatedAt === taxonomy.updatedAt) {
+          return taxonomyLookupCache
+        }
+
+        const byId = new Map<
+          number,
+          {
+            id: number
+            name: string
+            parentCategoryId: number | null
+            label: string
+          }
+        >()
+        for (const category of taxonomy.categories) {
+          byId.set(category.id, {
+            id: category.id,
+            name: category.name,
+            parentCategoryId:
+              category.parent_category_id != null ? Number(category.parent_category_id) : null,
+            label: category.name,
+          })
+        }
+        for (const category of taxonomy.categories) {
+          const parent =
+            category.parent_category_id != null
+              ? byId.get(Number(category.parent_category_id))
+              : null
+          const current = byId.get(category.id)
+          if (!current) continue
+          current.label = parent ? `${parent.name} / ${category.name}` : category.name
+        }
+
+        const byName = new Map<
+          string,
+          Array<{
+            id: number
+            name: string
+            parentCategoryId: number | null
+            label: string
+          }>
+        >()
+        const byLabel = new Map<
+          string,
+          {
+            id: number
+            name: string
+            parentCategoryId: number | null
+            label: string
+          }
+        >()
+        for (const entry of byId.values()) {
+          const nameKey = entry.name.trim().toLowerCase()
+          const labelKey = entry.label.trim().toLowerCase()
+          byName.set(nameKey, [...(byName.get(nameKey) ?? []), entry])
+          byLabel.set(labelKey, entry)
+        }
+
+        taxonomyLookupCache = { updatedAt: taxonomy.updatedAt, byId, byName, byLabel }
+        return taxonomyLookupCache
+      }
+
       function syncUiFromConfig(cfg: FilterConfig): void {
         enabledInput.checked = cfg.enabled
         modeSelect.value = cfg.mode
         for (const lv of ['public', 'lv1', 'lv2', 'lv3'] as const) {
           levelInputs[lv].checked = cfg.levels.includes(lv)
         }
+        homeSourceEnabledInput.checked = cfg.homeSourceEnabled
+        homeSourceCollapsedInput.checked = cfg.homeSourceCollapsedByDefault
         showBlockedPostsInput.checked = cfg.showBlockedPostsInTopic
         autoLoadInput.checked = cfg.autoLoadMore
       }
@@ -660,6 +928,8 @@ export function filterFeature(): Feature {
           enabled: enabledInput.checked,
           mode: (modeSelect.value as FilterMode) === 'loose' ? 'loose' : 'strict',
           levels: levels.length > 0 ? levels : (['public', 'lv1', 'lv2', 'lv3'] as Level[]),
+          homeSourceEnabled: homeSourceEnabledInput.checked,
+          homeSourceCollapsedByDefault: homeSourceCollapsedInput.checked,
           showBlockedPostsInTopic: showBlockedPostsInput.checked,
           autoLoadMore: autoLoadInput.checked,
         }
@@ -673,6 +943,7 @@ export function filterFeature(): Feature {
       function renderPickerSummaries(cfg: FilterConfig): void {
         catsSummary.textContent = `分类（含 ${cfg.categoriesInclude.length} / 排 ${cfg.categoriesExclude.length}）`
         tagsSummary.textContent = `标签（含 ${cfg.tagsInclude.length} / 排 ${cfg.tagsExclude.length}）`
+        homeSourceSummary.textContent = `首页补源（分类 ${cfg.homeSourceCategories.length} / 标签 ${cfg.homeSourceTags.length}）`
         blockedSummary.textContent = `屏蔽用户（${cfg.blockedUsers.length}）`
       }
 
@@ -692,6 +963,13 @@ export function filterFeature(): Feature {
           addStat('分类', `${cfg.categoriesInclude.length}/${cfg.categoriesExclude.length}`)
         if (cfg.tagsInclude.length || cfg.tagsExclude.length)
           addStat('标签', `${cfg.tagsInclude.length}/${cfg.tagsExclude.length}`)
+        if (cfg.homeSourceEnabled || cfg.homeSourceCategories.length || cfg.homeSourceTags.length)
+          addStat(
+            '补源',
+            cfg.homeSourceEnabled
+              ? `${cfg.homeSourceCategories.length}/${cfg.homeSourceTags.length}`
+              : '关闭'
+          )
         if (cfg.blockedUsers.length) addStat('屏蔽用户', String(cfg.blockedUsers.length))
         if (activeSummaryStats.childElementCount === 0) addStat('条件', '无')
       }
@@ -934,10 +1212,7 @@ export function filterFeature(): Feature {
         const queryKey = canonicalTagKey(queryRaw)
         const hasExact = q ? byKey.has(queryKey) || persistedCustomTags.has(queryKey) : false
         const canAddCustom =
-          !!queryKey &&
-          !hasExact &&
-          !isNoTagToken(queryRaw) &&
-          !activeKeys.has(queryKey)
+          !!queryKey && !hasExact && !isNoTagToken(queryRaw) && !activeKeys.has(queryKey)
         const customItem: TagItem | null = canAddCustom ? { name: queryRaw, custom: true } : null
 
         const MAX_NEUTRAL = 20
@@ -1073,6 +1348,279 @@ export function filterFeature(): Feature {
         }
       }
 
+      function sourceToggleButton(options: {
+        active: boolean
+        disabled?: boolean
+        onClick: () => void
+      }): HTMLButtonElement {
+        const btn = document.createElement('button')
+        btn.type = 'button'
+        btn.className = `btn sm${options.active ? ' primary selected' : ''}`
+        btn.disabled = !!options.disabled
+        btn.textContent = options.active ? '已补源' : '补到首页'
+        btn.addEventListener('click', options.onClick)
+        return btn
+      }
+
+      function renderHomeSourceCategoryPicker(cfg: FilterConfig, disabled: boolean): void {
+        const taxonomy = loadCachedTaxonomy(ctx.storage)
+        homeSourceCatsList.innerHTML = ''
+
+        const queryRaw = homeSourceCatsSearch.value.trim()
+        const q = queryRaw.toLowerCase()
+        const lookup = getTaxonomyLookup()
+        if (!lookup || !taxonomy) {
+          const empty = document.createElement('div')
+          empty.className = 'ld2-inline-help ld2-muted'
+          empty.textContent = '分类/标签未加载：请先点击“刷新分类/标签”'
+          homeSourceCatsList.appendChild(empty)
+          return
+        }
+
+        const activeSet = new Set(cfg.homeSourceCategories)
+        const activeItems: Array<{ id: number; label: string; custom?: boolean }> = []
+        const neutralItems: Array<{ id: number; label: string; custom?: boolean }> = []
+
+        for (const entry of lookup.byId.values()) {
+          const item = { id: entry.id, label: entry.label }
+          const matches = !q || item.label.toLowerCase().includes(q) || String(item.id).includes(q)
+          if (!matches) continue
+          if (activeSet.has(item.id)) activeItems.push(item)
+          else neutralItems.push(item)
+        }
+
+        for (const id of readCustomCategoryIds()) {
+          if (lookup.byId.has(id) || (!activeSet.has(id) && !(queryRaw && String(id).includes(q))))
+            continue
+          const item = { id, label: `编号：${id}（自定义分类）`, custom: true }
+          if (activeSet.has(id)) activeItems.push(item)
+          else neutralItems.push(item)
+        }
+
+        const queryId = Number.parseInt(queryRaw, 10)
+        if (
+          queryRaw &&
+          Number.isFinite(queryId) &&
+          queryId > 0 &&
+          !lookup.byId.has(queryId) &&
+          !activeItems.some((item) => item.id === queryId) &&
+          !neutralItems.some((item) => item.id === queryId)
+        ) {
+          neutralItems.unshift({
+            id: queryId,
+            label: `编号：${queryId}（自定义分类）`,
+            custom: true,
+          })
+        }
+
+        const items = [...activeItems, ...neutralItems.slice(0, 24)]
+        if (items.length === 0) {
+          const empty = document.createElement('div')
+          empty.className = 'ld2-inline-help ld2-muted'
+          empty.textContent = queryRaw ? '没有匹配的补源分类。' : '还没有选择首页补源分类。'
+          homeSourceCatsList.appendChild(empty)
+          return
+        }
+
+        for (const item of items) {
+          const row = document.createElement('div')
+          row.className = 'ld2-row'
+
+          const left = document.createElement('div')
+          left.className = 'left'
+          const title = document.createElement('div')
+          title.className = 'title'
+          title.textContent = item.label
+          const sub = document.createElement('div')
+          sub.className = 'sub'
+          sub.textContent = item.custom ? `自定义分类编号：${item.id}` : `分类编号：${item.id}`
+          left.appendChild(title)
+          left.appendChild(sub)
+
+          const action = sourceToggleButton({
+            active: activeSet.has(item.id),
+            disabled,
+            onClick: () => {
+              if (item.custom) rememberCustomCategoryIds([item.id])
+              const current = readConfig()
+              const next = new Set(current.homeSourceCategories)
+              if (next.has(item.id)) next.delete(item.id)
+              else next.add(item.id)
+              const updated: FilterConfig = {
+                ...current,
+                homeSourceCategories: uniqFiniteNumbers(Array.from(next)),
+              }
+              writeConfig(updated)
+              renderAll(updated, disabled)
+              scheduleApply({ full: true })
+            },
+          })
+
+          row.appendChild(left)
+          row.appendChild(action)
+          homeSourceCatsList.appendChild(row)
+        }
+      }
+
+      function renderHomeSourceTagPicker(cfg: FilterConfig, disabled: boolean): void {
+        const taxonomy = loadCachedTaxonomy(ctx.storage)
+        homeSourceTagsList.innerHTML = ''
+
+        if (!taxonomy) {
+          const empty = document.createElement('div')
+          empty.className = 'ld2-inline-help ld2-muted'
+          empty.textContent = '分类/标签未加载：请先点击“刷新分类/标签”'
+          homeSourceTagsList.appendChild(empty)
+          return
+        }
+
+        const queryRaw = homeSourceTagsSearch.value.trim()
+        const q = queryRaw.toLowerCase()
+        const activeKeys = new Set(
+          cfg.homeSourceTags.map((tag) => canonicalTagKey(tag)).filter(Boolean)
+        )
+        const byKey = new Map<string, { name: string; count?: number; custom?: boolean }>()
+        for (const tag of taxonomy.tags) {
+          const name = canonicalTagName(tag.name)
+          const key = canonicalTagKey(name)
+          if (!key || isNoTagToken(name)) continue
+          byKey.set(key, { name, count: tag.count })
+        }
+        for (const raw of readCustomTagNames()) {
+          const name = canonicalTagName(raw)
+          const key = canonicalTagKey(name)
+          if (!key || isNoTagToken(name) || byKey.has(key)) continue
+          byKey.set(key, { name, custom: true })
+        }
+
+        const activeItems: Array<{ name: string; count?: number; custom?: boolean }> = []
+        const neutralItems: Array<{ name: string; count?: number; custom?: boolean }> = []
+        for (const item of byKey.values()) {
+          const matches = !q || item.name.toLowerCase().includes(q)
+          if (!matches) continue
+          const key = canonicalTagKey(item.name)
+          if (activeKeys.has(key)) activeItems.push(item)
+          else neutralItems.push(item)
+        }
+        neutralItems.sort((a, b) => (b.count ?? 0) - (a.count ?? 0))
+
+        const queryKey = canonicalTagKey(queryRaw)
+        if (
+          queryKey &&
+          !isNoTagToken(queryRaw) &&
+          !byKey.has(queryKey) &&
+          !activeItems.some((item) => canonicalTagKey(item.name) === queryKey) &&
+          !neutralItems.some((item) => canonicalTagKey(item.name) === queryKey)
+        ) {
+          neutralItems.unshift({ name: queryRaw, custom: true })
+        }
+
+        const items = [...activeItems, ...neutralItems.slice(0, 24)]
+        if (items.length === 0) {
+          const empty = document.createElement('div')
+          empty.className = 'ld2-inline-help ld2-muted'
+          empty.textContent = queryRaw ? '没有匹配的补源标签。' : '还没有选择首页补源标签。'
+          homeSourceTagsList.appendChild(empty)
+          return
+        }
+
+        for (const item of items) {
+          const row = document.createElement('div')
+          row.className = 'ld2-row'
+
+          const left = document.createElement('div')
+          left.className = 'left'
+          const title = document.createElement('div')
+          title.className = 'title'
+          title.textContent = item.name
+          const sub = document.createElement('div')
+          sub.className = 'sub'
+          sub.textContent = item.custom ? '自定义标签补源' : `标签数量：${item.count ?? 0}`
+          left.appendChild(title)
+          left.appendChild(sub)
+
+          const key = canonicalTagKey(item.name)
+          const action = sourceToggleButton({
+            active: activeKeys.has(key),
+            disabled,
+            onClick: () => {
+              if (item.custom) rememberCustomTagNames([item.name])
+              const current = readConfig()
+              const next = new Map(
+                current.homeSourceTags.map(
+                  (tag) => [canonicalTagKey(tag), canonicalTagName(tag)] as const
+                )
+              )
+              if (next.has(key)) next.delete(key)
+              else next.set(key, canonicalTagName(item.name))
+              const updated: FilterConfig = {
+                ...current,
+                homeSourceTags: Array.from(next.values()),
+              }
+              writeConfig(updated)
+              renderAll(updated, disabled)
+              scheduleApply({ full: true })
+            },
+          })
+
+          row.appendChild(left)
+          row.appendChild(action)
+          homeSourceTagsList.appendChild(row)
+        }
+      }
+
+      function renderHomeSourceStatus(cfg: FilterConfig): void {
+        homeSourceStatusMeta.textContent = ''
+        homeSourceStatusList.innerHTML = ''
+        if (!cfg.homeSourceEnabled) {
+          homeSourceStatus.textContent = '未启用'
+          return
+        }
+        if (homeSourceRuntimeStatus) {
+          homeSourceStatus.textContent = homeSourceRuntimeStatus
+        } else if (cfg.homeSourceCategories.length === 0 && cfg.homeSourceTags.length === 0) {
+          homeSourceStatus.textContent = '已启用，但还没有选择任何补源分类或标签'
+        } else {
+          const route = ctx.discourse.getRouteInfo()
+          homeSourceStatus.textContent = isHomeFeedPage(route.pathname)
+            ? `已启用：分类 ${cfg.homeSourceCategories.length} / 标签 ${cfg.homeSourceTags.length}`
+            : '已启用：当前不在首页，切回 / 或 /latest 后会生效'
+        }
+
+        homeSourceStatusMeta.textContent = `上次刷新：${formatRuntimeTime(homeSourceLastFetchedAt)}`
+
+        const statuses = Array.from(homeSourceRequestStatuses.values()).sort((a, b) =>
+          a.label.localeCompare(b.label, 'zh-CN')
+        )
+        for (const item of statuses) {
+          const row = document.createElement('div')
+          row.className = 'ld2-row'
+          const left = document.createElement('div')
+          left.className = 'left'
+          const title = document.createElement('div')
+          title.className = 'title'
+          title.textContent = `${item.kind === 'category' ? '分类' : '标签'} · ${item.label}`
+          const sub = document.createElement('div')
+          sub.className = 'sub'
+          sub.textContent = item.ok
+            ? `成功 · 候选 ${item.topicCount} · ${formatRuntimeTime(item.updatedAt)}`
+            : `失败 · ${item.error || '未知错误'} · ${formatRuntimeTime(item.updatedAt)}`
+          left.appendChild(title)
+          left.appendChild(sub)
+          const retryBtn = document.createElement('button')
+          retryBtn.type = 'button'
+          retryBtn.className = 'btn sm'
+          retryBtn.disabled = homeSourceInflightSignature.length > 0
+          retryBtn.textContent = '重试'
+          retryBtn.addEventListener('click', () => {
+            void refreshHomeSourceData(readConfig(), { force: true, onlyKeys: [item.key] })
+          })
+          row.appendChild(left)
+          row.appendChild(retryBtn)
+          homeSourceStatusList.appendChild(row)
+        }
+      }
+
       function renderBlockedUsers(cfg: FilterConfig, disabled: boolean): void {
         blockedList.innerHTML = ''
 
@@ -1150,7 +1698,8 @@ export function filterFeature(): Feature {
           const article = getTopicPostArticle(item)
           if (!article) continue
           const hideTarget = getBlockedPostHideTarget(item, article)
-          if (hideTarget.dataset.ld2BlockedPostHidden) delete hideTarget.dataset.ld2BlockedPostHidden
+          if (hideTarget.dataset.ld2BlockedPostHidden)
+            delete hideTarget.dataset.ld2BlockedPostHidden
           hideTarget.style.removeProperty('display')
           const inserted = getBlockedPostPlaceholder(article)
           inserted?.remove()
@@ -1196,7 +1745,8 @@ export function filterFeature(): Feature {
           if (!shouldHide) {
             clearBlockedPostTemporaryReveal(item)
             if (item.dataset.ld2BlockedPostHidden) delete item.dataset.ld2BlockedPostHidden
-            if (hideTarget.dataset.ld2BlockedPostHidden) delete hideTarget.dataset.ld2BlockedPostHidden
+            if (hideTarget.dataset.ld2BlockedPostHidden)
+              delete hideTarget.dataset.ld2BlockedPostHidden
             item.style.removeProperty('display')
             hideTarget.style.removeProperty('display')
             existingPlaceholder?.remove()
@@ -1205,7 +1755,8 @@ export function filterFeature(): Feature {
 
           if (temporarilyRevealed) {
             if (item.dataset.ld2BlockedPostHidden) delete item.dataset.ld2BlockedPostHidden
-            if (hideTarget.dataset.ld2BlockedPostHidden) delete hideTarget.dataset.ld2BlockedPostHidden
+            if (hideTarget.dataset.ld2BlockedPostHidden)
+              delete hideTarget.dataset.ld2BlockedPostHidden
             item.style.removeProperty('display')
             hideTarget.style.removeProperty('display')
             existingPlaceholder?.remove()
@@ -1226,7 +1777,8 @@ export function filterFeature(): Feature {
               markBlockedPostTemporarilyRevealed(item)
               placeholder.remove()
               delete item.dataset.ld2BlockedPostHidden
-              if (hideTarget.dataset.ld2BlockedPostHidden) delete hideTarget.dataset.ld2BlockedPostHidden
+              if (hideTarget.dataset.ld2BlockedPostHidden)
+                delete hideTarget.dataset.ld2BlockedPostHidden
               item.style.removeProperty('display')
               hideTarget.style.removeProperty('display')
             })
@@ -1254,7 +1806,487 @@ export function filterFeature(): Feature {
         renderActiveSummary(cfg)
         renderCategoryPicker(cfg, disabled)
         renderTagPicker(cfg, disabled)
+        renderHomeSourceCategoryPicker(cfg, disabled)
+        renderHomeSourceTagPicker(cfg, disabled)
+        renderHomeSourceStatus(cfg)
         renderBlockedUsers(cfg, disabled)
+      }
+
+      let homeSourceRuntimeStatus = ''
+      let homeSourceFetchAbort: AbortController | null = null
+      let homeSourceFetchSeq = 0
+      let homeSourceCacheSignature = ''
+      let homeSourceInflightSignature = ''
+      let homeSourceCacheTopics: HomeSourceTopic[] = []
+      let homeSourceLastFetchedAt = 0
+      let homeSourceLastRequestCount = 0
+      let homeSourceLastErrorCount = 0
+      const homeSourceTopicsByRequest = new Map<string, HomeSourceTopic[]>()
+      const homeSourceRequestStatuses = new Map<
+        string,
+        {
+          key: string
+          label: string
+          kind: 'category' | 'tag'
+          ok: boolean
+          topicCount: number
+          error: string | null
+          updatedAt: number
+        }
+      >()
+
+      function formatRuntimeTime(ts: number): string {
+        if (!Number.isFinite(ts) || ts <= 0) return '未刷新'
+        try {
+          return new Date(ts).toLocaleString('zh-CN', {
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+          })
+        } catch {
+          return '未刷新'
+        }
+      }
+
+      function rebuildHomeSourceCacheTopics(): void {
+        const merged = new Map<number, HomeSourceTopic>()
+        for (const topics of homeSourceTopicsByRequest.values()) {
+          for (const topic of topics) {
+            const current = merged.get(topic.id)
+            if (!current) {
+              merged.set(topic.id, topic)
+              continue
+            }
+            const currentTime = Date.parse(current.bumpedAt || current.createdAt || '')
+            const nextTime = Date.parse(topic.bumpedAt || topic.createdAt || '')
+            if (
+              (Number.isFinite(nextTime) ? nextTime : 0) >
+              (Number.isFinite(currentTime) ? currentTime : 0)
+            ) {
+              merged.set(topic.id, topic)
+            }
+          }
+        }
+        homeSourceCacheTopics = Array.from(merged.values())
+      }
+
+      function getTopicListItemId(el: HTMLElement): number | null {
+        const raw = el.getAttribute('data-topic-id') || el.dataset.topicId || ''
+        const direct = Number.parseInt(raw, 10)
+        if (Number.isFinite(direct) && direct > 0) return direct
+        const titleLink = el.querySelector<HTMLAnchorElement>(
+          'a.title[href*="/t/"], a.raw-topic-link[href*="/t/"], .main-link a[href*="/t/"]'
+        )
+        return titleLink
+          ? parseTopicIdFromHref(titleLink.getAttribute('href') || titleLink.href)
+          : null
+      }
+
+      function getNativeTopicIds(container?: ParentNode | null): Set<number> {
+        const out = new Set<number>()
+        for (const item of getTopicItems(container)) {
+          const id = getTopicListItemId(item)
+          if (id) out.add(id)
+        }
+        return out
+      }
+
+      function getHomeSourcePanel(): HTMLElement | null {
+        return document.getElementById('ld2-home-source-feed')
+      }
+
+      function removeHomeSourcePanel(): void {
+        getHomeSourcePanel()?.remove()
+      }
+
+      function isHomeSourcePanelExpanded(cfg: FilterConfig): boolean {
+        const stored = ctx.storage.get(KEY_HOME_SOURCE_PANEL_EXPANDED, null as boolean | null)
+        return typeof stored === 'boolean' ? stored : !cfg.homeSourceCollapsedByDefault
+      }
+
+      function setHomeSourcePanelExpanded(expanded: boolean): void {
+        ctx.storage.set(KEY_HOME_SOURCE_PANEL_EXPANDED, expanded)
+      }
+
+      function applyHomeSourcePanelExpandedState(
+        panel: HTMLElement,
+        body: HTMLElement,
+        toggle: HTMLButtonElement,
+        refresh: HTMLButtonElement,
+        expanded: boolean
+      ): void {
+        panel.classList.toggle('is-collapsed', !expanded)
+        body.hidden = !expanded
+        refresh.hidden = !expanded
+        toggle.textContent = expanded ? '收起' : '展开'
+        toggle.setAttribute('aria-expanded', String(expanded))
+      }
+
+      function ensureHomeSourcePanel(container: HTMLElement): HTMLElement {
+        const existing = getHomeSourcePanel()
+        if (existing) return existing
+
+        const panel = document.createElement('section')
+        panel.id = 'ld2-home-source-feed'
+        panel.className = 'ld2-home-source-feed'
+        const mountTarget =
+          container.closest<HTMLElement>('table.topic-list') ??
+          container.closest<HTMLElement>('.topic-list') ??
+          container
+        mountTarget.parentElement?.insertBefore(panel, mountTarget)
+        return panel
+      }
+
+      function formatHomeSourceTime(raw: string | null): string {
+        if (!raw) return '时间未知'
+        const value = Date.parse(raw)
+        if (!Number.isFinite(value)) return raw
+        try {
+          return new Date(value).toLocaleString('zh-CN', {
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+          })
+        } catch {
+          return raw
+        }
+      }
+
+      function renderHomeSourcePanelFromCache(cfg: FilterConfig): void {
+        const route = ctx.discourse.getRouteInfo()
+        const container = getListContainer()
+        if (
+          !container ||
+          !isHomeFeedPage(route.pathname) ||
+          ctx.storage.get('read.enabled', false) ||
+          !cfg.homeSourceEnabled ||
+          (cfg.homeSourceCategories.length === 0 && cfg.homeSourceTags.length === 0)
+        ) {
+          removeHomeSourcePanel()
+          return
+        }
+
+        const taxonomy = loadCachedTaxonomy(ctx.storage)
+        const selected = selectHomeSourceTopics({
+          topics: homeSourceCacheTopics,
+          existingTopicIds: getNativeTopicIds(container),
+          cfg,
+          taxonomy,
+          limit: HOME_SOURCE_LIMIT,
+        })
+
+        if (selected.length === 0) {
+          homeSourceRuntimeStatus =
+            homeSourceCacheTopics.length > 0
+              ? `已拉取 ${homeSourceCacheTopics.length} 条候选，但当前筛选后没有可展示主题`
+              : homeSourceLastRequestCount > 0
+                ? '已尝试补源，但没有拉到可用主题'
+                : homeSourceRuntimeStatus
+          renderHomeSourceStatus(cfg)
+          removeHomeSourcePanel()
+          return
+        }
+
+        const panel = ensureHomeSourcePanel(container)
+        panel.innerHTML = ''
+        const expanded = isHomeSourcePanelExpanded(cfg)
+
+        const header = document.createElement('div')
+        header.className = 'ld2-home-source-header'
+        const titleWrap = document.createElement('div')
+        const title = document.createElement('div')
+        title.className = 'ld2-home-source-title'
+        title.textContent = '首页补源主题'
+        const desc = document.createElement('div')
+        desc.className = 'ld2-home-source-sub'
+        desc.textContent = `来源 ${homeSourceLastRequestCount} 个 · 展示 ${selected.length} 条`
+        titleWrap.appendChild(title)
+        titleWrap.appendChild(desc)
+        const actions = document.createElement('div')
+        actions.className = 'ld2-home-source-actions'
+        const statusPill = document.createElement('div')
+        statusPill.className = 'ld2-home-source-count'
+        statusPill.textContent = `${selected.length}`
+        const refresh = document.createElement('button')
+        refresh.type = 'button'
+        refresh.className = 'ld2-home-source-refresh'
+        refresh.title = '强制重新拉取首页补源主题'
+        const toggle = document.createElement('button')
+        toggle.type = 'button'
+        toggle.className = 'ld2-home-source-toggle'
+        actions.appendChild(statusPill)
+        actions.appendChild(refresh)
+        actions.appendChild(toggle)
+        header.appendChild(titleWrap)
+        header.appendChild(actions)
+
+        const body = document.createElement('div')
+        body.className = 'ld2-home-source-body'
+        const list = document.createElement('div')
+        list.className = 'ld2-home-source-list'
+        const lookup = getTaxonomyLookup()
+        for (const topic of selected) {
+          const item = document.createElement('article')
+          item.className = 'ld2-home-source-item'
+
+          const top = document.createElement('div')
+          top.className = 'ld2-home-source-top'
+          const sourceBadge = document.createElement('span')
+          sourceBadge.className = 'ld2-home-source-badge'
+          sourceBadge.textContent =
+            topic.sourceKind === 'category'
+              ? `分类 · ${topic.sourceLabel}`
+              : `标签 · ${topic.sourceLabel}`
+          top.appendChild(sourceBadge)
+
+          const link = document.createElement('a')
+          link.className = 'ld2-home-source-link'
+          link.href = `/t/${topic.slug || 'topic'}/${topic.id}`
+          link.textContent = topic.title
+
+          const meta = document.createElement('div')
+          meta.className = 'ld2-home-source-meta'
+          const category =
+            topic.categoryId != null ? (lookup?.byId.get(topic.categoryId) ?? null) : null
+          if (category) {
+            const cat = document.createElement('span')
+            cat.className = 'ld2-home-source-chip'
+            cat.textContent = category.label
+            meta.appendChild(cat)
+          } else if (topic.categoryId != null) {
+            const cat = document.createElement('span')
+            cat.className = 'ld2-home-source-chip'
+            cat.textContent = `分类 #${topic.categoryId}`
+            meta.appendChild(cat)
+          }
+          for (const tag of topic.tags.slice(0, 5)) {
+            const chip = document.createElement('a')
+            chip.className = 'ld2-home-source-chip ld2-home-source-chip-link'
+            chip.href = `/tag/${encodeURIComponent(tag)}`
+            chip.textContent = `#${tag}`
+            meta.appendChild(chip)
+          }
+
+          const foot = document.createElement('div')
+          foot.className = 'ld2-home-source-foot'
+          const author = document.createElement('span')
+          author.textContent = topic.authorUsername ? `@${topic.authorUsername}` : '未知作者'
+          foot.appendChild(author)
+          const stats = document.createElement('span')
+          stats.textContent = `回复 ${topic.replyCount} · 浏览 ${topic.views} · 赞 ${topic.likeCount} · ${formatHomeSourceTime(topic.bumpedAt || topic.createdAt)}`
+          foot.appendChild(stats)
+
+          item.appendChild(top)
+          item.appendChild(link)
+          if (meta.childElementCount > 0) item.appendChild(meta)
+          item.appendChild(foot)
+          list.appendChild(item)
+        }
+        body.appendChild(list)
+
+        const syncRefreshButtonState = (): void => {
+          const loading = homeSourceInflightSignature.length > 0
+          refresh.disabled = loading
+          refresh.textContent = loading ? '刷新中…' : '刷新'
+        }
+
+        refresh.addEventListener('click', () => {
+          if (homeSourceInflightSignature.length > 0) {
+            syncRefreshButtonState()
+            return
+          }
+          syncRefreshButtonState()
+          void refreshHomeSourceData(readConfig(), { force: true }).finally(() => {
+            syncRefreshButtonState()
+          })
+        })
+        toggle.addEventListener('click', () => {
+          const nextExpanded = body.hidden
+          setHomeSourcePanelExpanded(nextExpanded)
+          applyHomeSourcePanelExpandedState(panel, body, toggle, refresh, nextExpanded)
+        })
+        applyHomeSourcePanelExpandedState(panel, body, toggle, refresh, expanded)
+        syncRefreshButtonState()
+
+        panel.appendChild(header)
+        panel.appendChild(body)
+
+        homeSourceRuntimeStatus =
+          homeSourceLastErrorCount > 0
+            ? `已拉取 ${homeSourceCacheTopics.length} 条候选，展示 ${selected.length} 条（${homeSourceLastErrorCount} 个来源失败）`
+            : `已拉取 ${homeSourceCacheTopics.length} 条候选，展示 ${selected.length} 条`
+        renderHomeSourceStatus(cfg)
+      }
+
+      async function refreshHomeSourceData(
+        cfg: FilterConfig,
+        options?: {
+          force?: boolean
+          onlyKeys?: string[]
+        }
+      ): Promise<void> {
+        const route = ctx.discourse.getRouteInfo()
+        const noSources = cfg.homeSourceCategories.length === 0 && cfg.homeSourceTags.length === 0
+        if (
+          !cfg.homeSourceEnabled ||
+          noSources ||
+          !isHomeFeedPage(route.pathname) ||
+          ctx.storage.get('read.enabled', false)
+        ) {
+          homeSourceFetchAbort?.abort()
+          homeSourceFetchAbort = null
+          homeSourceInflightSignature = ''
+          homeSourceRuntimeStatus = !cfg.homeSourceEnabled
+            ? '未启用'
+            : noSources
+              ? '已启用，但还没有选择任何补源分类或标签'
+              : '当前不在首页，切回 / 或 /latest 后会生效'
+          renderHomeSourceStatus(cfg)
+          removeHomeSourcePanel()
+          return
+        }
+
+        const taxonomy = loadCachedTaxonomy(ctx.storage)
+        const allRequests = buildHomeSourceRequests({
+          origin: window.location.origin,
+          taxonomy,
+          categoryIds: cfg.homeSourceCategories,
+          tagNames: cfg.homeSourceTags,
+        })
+        const onlyKeySet =
+          options?.onlyKeys && options.onlyKeys.length > 0 ? new Set(options.onlyKeys) : null
+        const requests = onlyKeySet
+          ? allRequests.filter((request) => onlyKeySet.has(request.key))
+          : allRequests
+        if (allRequests.length === 0 || requests.length === 0) {
+          homeSourceInflightSignature = ''
+          homeSourceRuntimeStatus = '没有可用的补源配置'
+          renderHomeSourceStatus(cfg)
+          removeHomeSourcePanel()
+          return
+        }
+
+        const signature = JSON.stringify(
+          allRequests.map((request) => request.key).sort((a, b) => a.localeCompare(b))
+        )
+        homeSourceLastRequestCount = allRequests.length
+        if (!onlyKeySet && !options?.force && signature === homeSourceCacheSignature) {
+          renderHomeSourcePanelFromCache(cfg)
+          return
+        }
+        if (!options?.force && signature === homeSourceInflightSignature) {
+          return
+        }
+
+        homeSourceFetchAbort?.abort()
+        const abortController = new AbortController()
+        homeSourceFetchAbort = abortController
+        const fetchSeq = ++homeSourceFetchSeq
+        homeSourceInflightSignature = signature
+        homeSourceRuntimeStatus = `正在拉取首页补源（${requests.length} / ${allRequests.length} 个来源）…`
+        renderHomeSourceStatus(cfg)
+
+        const settled = await Promise.allSettled(
+          requests.map(async (request) => {
+            let responseJson: TopicListResponseJson | null = null
+            let lastError: unknown = null
+            for (const url of request.urls) {
+              try {
+                const res = await fetch(url, {
+                  signal: abortController.signal,
+                  credentials: 'include',
+                  cache: 'force-cache',
+                })
+                if (!res.ok) throw new Error(`http ${res.status}`)
+                responseJson = (await res.json()) as TopicListResponseJson
+                break
+              } catch (err) {
+                if (err instanceof DOMException && err.name === 'AbortError') throw err
+                lastError = err
+              }
+            }
+            if (!responseJson) throw lastError ?? new Error('home source fetch failed')
+            const topics = normalizeHomeSourceTopics(responseJson, request)
+            return {
+              key: request.key,
+              label: request.label,
+              kind: request.kind,
+              topics: filterHomeSourceTopicsByRequest({ topics, request, taxonomy }),
+            }
+          })
+        ).catch((err) => {
+          if (err instanceof DOMException && err.name === 'AbortError') return null
+          throw err
+        })
+
+        if (!settled || abortController.signal.aborted || fetchSeq !== homeSourceFetchSeq) return
+
+        const activeKeys = new Set(allRequests.map((request) => request.key))
+        for (const key of Array.from(homeSourceRequestStatuses.keys())) {
+          if (!activeKeys.has(key)) {
+            homeSourceRequestStatuses.delete(key)
+            homeSourceTopicsByRequest.delete(key)
+          }
+        }
+
+        for (let index = 0; index < settled.length; index += 1) {
+          const result = settled[index]
+          const request = requests[index]
+          if (!request) continue
+          if (result.status !== 'fulfilled') {
+            const reason =
+              result.reason instanceof Error && result.reason.message
+                ? result.reason.message
+                : 'home source fetch failed'
+            homeSourceRequestStatuses.set(request.key, {
+              key: request.key,
+              label: request.label,
+              kind: request.kind,
+              ok: false,
+              topicCount: 0,
+              error: reason,
+              updatedAt: Date.now(),
+            })
+            homeSourceTopicsByRequest.set(request.key, [])
+            continue
+          }
+          homeSourceRequestStatuses.set(request.key, {
+            key: request.key,
+            label: result.value.label,
+            kind: result.value.kind,
+            ok: true,
+            topicCount: result.value.topics.length,
+            error: null,
+            updatedAt: Date.now(),
+          })
+          homeSourceTopicsByRequest.set(request.key, result.value.topics)
+        }
+
+        for (const request of allRequests) {
+          if (!homeSourceRequestStatuses.has(request.key)) {
+            homeSourceRequestStatuses.set(request.key, {
+              key: request.key,
+              label: request.label,
+              kind: request.kind,
+              ok: false,
+              topicCount: 0,
+              error: '尚未拉取',
+              updatedAt: 0,
+            })
+            homeSourceTopicsByRequest.set(request.key, [])
+          }
+        }
+
+        homeSourceCacheSignature = signature
+        homeSourceInflightSignature = ''
+        homeSourceLastFetchedAt = Date.now()
+        rebuildHomeSourceCacheTopics()
+        homeSourceLastErrorCount = Array.from(homeSourceRequestStatuses.values()).filter(
+          (item) => !item.ok
+        ).length
+        renderHomeSourcePanelFromCache(cfg)
       }
 
       let lastAutoLoadAt = 0
@@ -1320,7 +2352,11 @@ export function filterFeature(): Feature {
         }, 120)
       }
 
-      const topicMetaCache = new WeakMap<HTMLElement, TopicMeta>()
+      let topicMetaCache = new WeakMap<HTMLElement, TopicMeta>()
+
+      function resetTopicMetaCache(): void {
+        topicMetaCache = new WeakMap<HTMLElement, TopicMeta>()
+      }
 
       function invalidateTopicMeta(item: HTMLElement): void {
         topicMetaCache.delete(item)
@@ -1330,8 +2366,31 @@ export function filterFeature(): Feature {
         const cached = topicMetaCache.get(item)
         if (cached) return cached
         const next = extractTopicMeta(item)
-        topicMetaCache.set(item, next)
-        return next
+        const lookup = getTaxonomyLookup()
+        let matchedCategory =
+          next.categoryId != null ? (lookup?.byId.get(next.categoryId) ?? null) : null
+        if (!matchedCategory) {
+          const categoryText = parseCategoryTextFromElement(item)
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase()
+          if (categoryText) {
+            matchedCategory =
+              lookup?.byLabel.get(categoryText) ??
+              (() => {
+                const matches = lookup?.byName.get(categoryText) ?? []
+                return matches.length === 1 ? matches[0] : null
+              })() ??
+              null
+          }
+        }
+        const enriched: TopicMeta = {
+          ...next,
+          categoryId: next.categoryId ?? matchedCategory?.id ?? null,
+          parentCategoryId: next.parentCategoryId ?? matchedCategory?.parentCategoryId ?? null,
+        }
+        topicMetaCache.set(item, enriched)
+        return enriched
       }
 
       function setListStatus(
@@ -1356,7 +2415,7 @@ export function filterFeature(): Feature {
       }
 
       function applyListFilterToItem(el: HTMLElement, effectiveCfg: FilterConfig): boolean {
-        const topicId = el.getAttribute('data-topic-id') || el.dataset.topicId
+        const topicId = getTopicListItemId(el)
         // v1 parity: Discourse may insert "system rows" without topic id; never hide them.
         if (!topicId) {
           if (el.dataset.ld2FilterHidden) {
@@ -1393,11 +2452,13 @@ export function filterFeature(): Feature {
         }
         const total = getTopicItems(container).length
         const hidden = container
-          ? container.querySelectorAll<HTMLElement>('.topic-list-item[data-ld2-filter-hidden]').length
+          ? container.querySelectorAll<HTMLElement>('.topic-list-item[data-ld2-filter-hidden]')
+              .length
           : 0
         const visible = Math.max(0, total - hidden)
         setListStatus(cfg, ignoreTaxonomyFilters, hidden, total)
         tryAutoLoadMore(effectiveCfg, visible)
+        void refreshHomeSourceData(cfg)
       }
 
       function collectChangedTopicItems(records: MutationRecord[]): Set<HTMLElement> {
@@ -1426,6 +2487,8 @@ export function filterFeature(): Feature {
       }
 
       function applyOnce(cfg: FilterConfig): void {
+        resetTopicMetaCache()
+
         // v1 parity: autoRead enabled => disable filtering (avoid shrinking the list / changing reading rhythm).
         if (ctx.storage.get('read.enabled', false)) {
           setControlsDisabled(true)
@@ -1438,6 +2501,7 @@ export function filterFeature(): Feature {
           }
           resetTopicPostVisibility()
           setStatus('自动阅读：筛选暂停（停止自动阅读后恢复）')
+          removeHomeSourcePanel()
           return
         }
         setControlsDisabled(false)
@@ -1452,6 +2516,7 @@ export function filterFeature(): Feature {
                 ? '已生效'
                 : '空闲'
           )
+          removeHomeSourcePanel()
           return
         }
 
@@ -1467,6 +2532,7 @@ export function filterFeature(): Feature {
             }
           }
           setStatus('空闲')
+          removeHomeSourcePanel()
           return
         }
 
@@ -1481,6 +2547,7 @@ export function filterFeature(): Feature {
         const visible = Math.max(0, items.length - hidden)
         setListStatus(cfg, ignoreTaxonomyFilters, hidden, items.length)
         tryAutoLoadMore(effectiveCfg, visible)
+        void refreshHomeSourceData(cfg)
       }
 
       let observer: MutationObserver | null = null
@@ -1532,7 +2599,11 @@ export function filterFeature(): Feature {
               ctx.logger.info(
                 `taxonomy refreshed: ${t.categories.length} categories, ${t.tags.length} tags`
               )
-              renderAll(readConfig(), false)
+              const next = readConfig()
+              resetTopicMetaCache()
+              renderAll(next, false)
+              scheduleApply({ full: true })
+              void refreshHomeSourceData(next, { force: false })
             })
             .catch((e) => ctx.logger.warn('taxonomy refresh failed', e))
         }
@@ -1568,21 +2639,35 @@ export function filterFeature(): Feature {
           }
         }
 
-        if (!(cfg.enabled || cfg.blockedUsers.length > 0) || !isListPage(route.pathname)) {
+        const shouldObserveHomeSource =
+          cfg.homeSourceEnabled &&
+          (cfg.homeSourceCategories.length > 0 || cfg.homeSourceTags.length > 0) &&
+          isHomeFeedPage(route.pathname)
+        if (
+          !(cfg.enabled || cfg.blockedUsers.length > 0 || shouldObserveHomeSource) ||
+          !isListPage(route.pathname)
+        ) {
           return null
         }
 
         return {
-          container: getListContainer(),
+          container:
+            document.querySelector<HTMLElement>('#main-outlet') ??
+            getListContainer() ??
+            document.body ??
+            document.documentElement,
           options: {
             childList: true,
             subtree: true,
+            characterData: true,
             attributes: true,
             attributeFilter: [
               'class',
+              'data-topic-id',
               'data-category-id',
               'data-parent-category-id',
               'data-tag-name',
+              'href',
             ],
           },
         }
@@ -1628,6 +2713,9 @@ export function filterFeature(): Feature {
       function onAnyConfigChanged(): void {
         const cfg = readConfig()
         const next = readCoreUiToConfig(cfg)
+        if (cfg.homeSourceCollapsedByDefault !== next.homeSourceCollapsedByDefault) {
+          ctx.storage.remove(KEY_HOME_SOURCE_PANEL_EXPANDED)
+        }
         writeConfig(next)
         connectObserver()
         renderAll(next, false)
@@ -1636,6 +2724,8 @@ export function filterFeature(): Feature {
 
       enabledInput.addEventListener('change', onAnyConfigChanged)
       modeSelect.addEventListener('change', onAnyConfigChanged)
+      homeSourceEnabledInput.addEventListener('change', onAnyConfigChanged)
+      homeSourceCollapsedInput.addEventListener('change', onAnyConfigChanged)
       showBlockedPostsInput.addEventListener('change', onAnyConfigChanged)
       autoLoadInput.addEventListener('change', onAnyConfigChanged)
       for (const lv of ['public', 'lv1', 'lv2', 'lv3'] as const) {
@@ -1644,8 +2734,12 @@ export function filterFeature(): Feature {
 
       const onCatsSearch = () => renderCategoryPicker(readConfig(), false)
       const onTagsSearch = () => renderTagPicker(readConfig(), false)
+      const onHomeSourceCatsSearch = () => renderHomeSourceCategoryPicker(readConfig(), false)
+      const onHomeSourceTagsSearch = () => renderHomeSourceTagPicker(readConfig(), false)
       catsSearch.addEventListener('input', onCatsSearch)
       tagsSearch.addEventListener('input', onTagsSearch)
+      homeSourceCatsSearch.addEventListener('input', onHomeSourceCatsSearch)
+      homeSourceTagsSearch.addEventListener('input', onHomeSourceTagsSearch)
 
       const blockCurrentTopicAuthor = () => {
         const route = ctx.discourse.getRouteInfo()
@@ -1698,13 +2792,18 @@ export function filterFeature(): Feature {
           categoriesExclude: [],
           tagsInclude: [],
           tagsExclude: [],
+          homeSourceEnabled: false,
+          homeSourceCategories: [],
+          homeSourceTags: [],
           blockedUsers: [],
         }
         writeConfig(next)
         renderAll(next, false)
         scheduleApply({ full: true })
         connectObserver()
-        window.dispatchEvent(new CustomEvent('ld2:toast', { detail: { title: '筛选条件已清空' } }))
+        window.dispatchEvent(
+          new CustomEvent('ld2:toast', { detail: { title: '筛选与补源条件已清空' } })
+        )
       }
       clearBtn.addEventListener('click', onClear)
 
@@ -1722,7 +2821,9 @@ export function filterFeature(): Feature {
                 },
               })
             )
-            renderAll(readConfig(), false)
+            const next = readConfig()
+            renderAll(next, false)
+            void refreshHomeSourceData(next, { force: true })
           })
           .catch(() => {
             setStatus('分类/标签刷新失败')
@@ -1780,6 +2881,8 @@ export function filterFeature(): Feature {
         toDisposable(() => {
           enabledInput.removeEventListener('change', onAnyConfigChanged)
           modeSelect.removeEventListener('change', onAnyConfigChanged)
+          homeSourceEnabledInput.removeEventListener('change', onAnyConfigChanged)
+          homeSourceCollapsedInput.removeEventListener('change', onAnyConfigChanged)
           showBlockedPostsInput.removeEventListener('change', onAnyConfigChanged)
           autoLoadInput.removeEventListener('change', onAnyConfigChanged)
           for (const lv of ['public', 'lv1', 'lv2', 'lv3'] as const) {
@@ -1787,6 +2890,8 @@ export function filterFeature(): Feature {
           }
           catsSearch.removeEventListener('input', onCatsSearch)
           tagsSearch.removeEventListener('input', onTagsSearch)
+          homeSourceCatsSearch.removeEventListener('input', onHomeSourceCatsSearch)
+          homeSourceTagsSearch.removeEventListener('input', onHomeSourceTagsSearch)
           blockedAddBtn.removeEventListener('click', addBlockedUser)
           blockedInput.removeEventListener('keydown', onBlockedInputKeydown)
           quickBlockAuthorBtn.removeEventListener('click', blockCurrentTopicAuthor)
@@ -1799,12 +2904,15 @@ export function filterFeature(): Feature {
           window.removeEventListener('focus', onWindowFocus)
           refreshBtn.removeEventListener('click', onRefreshTaxonomy)
           clearBtn.removeEventListener('click', onClear)
+          homeSourceFetchAbort?.abort()
+          removeHomeSourcePanel()
           activeSummaryCard.remove()
           enabledLabel.remove()
           modeSelect.remove()
           levelsWrap.remove()
           catsDetails.remove()
           tagsDetails.remove()
+          homeSourceDetails.remove()
           blockedDetails.remove()
           autoLoadLabel.remove()
           miscRow.remove()

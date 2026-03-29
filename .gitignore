@@ -4,3 +4,12 @@ coverage/
 dist/
 
 .ace-tool/
+
+# BMad install artifacts
+.agent/
+.agents/
+_bmad/
+_bmad-output/
+.claude/skills/bmad-*/
+.claude/skills/gds-*/
+.claude/skills/wds-*/

@@ -1,6 +1,10 @@
-import type { DomSnapshotScrollConfig } from './domSnapshot'
 import { getPassiveUserActivityOuterHtmlCache } from './domPassiveCache'
 import { cleanUrlParamU, hasUrlParamU } from '../../shared/url'
+import {
+  collectByScrolling,
+  hasVisibleMatch,
+  type SharedDomScrollConfig,
+} from './scrolling'
 
 export type UserActivityEntry = {
   postId: string
@@ -155,174 +159,12 @@ function collectVisibleUserActivityOuterHtml(): Map<string, { html: string; time
   return cache
 }
 
-function clampInt(value: number, min: number, max: number, fallback: number): number {
-  if (!Number.isFinite(value)) return fallback
-  const n = Math.floor(value)
-  return Math.min(max, Math.max(min, n))
-}
-
-function getDocumentScrollHeight(): number {
-  try {
-    const body = document.body
-    const el = document.documentElement
-    const candidates = [
-      body?.scrollHeight ?? 0,
-      body?.offsetHeight ?? 0,
-      el?.scrollHeight ?? 0,
-      el?.offsetHeight ?? 0,
-      el?.clientHeight ?? 0,
-    ]
-    return Math.max(...candidates)
-  } catch {
-    return document.body.scrollHeight
-  }
-}
-
-function isVisibleElement(el: Element): boolean {
-  if (!(el instanceof HTMLElement)) return true
-  const style = window.getComputedStyle(el)
-  if (style.display === 'none') return false
-  if (style.visibility === 'hidden') return false
-  if (style.opacity === '0') return false
-  return true
-}
-
-function hasVisibleMatch(selector: string, root: ParentNode = document): boolean {
-  try {
-    const els = Array.from(root.querySelectorAll(selector))
-    for (const el of els) {
-      if (!isVisibleElement(el)) continue
-      try {
-        const rect = (el as Element).getBoundingClientRect()
-        if (rect.width <= 0 || rect.height <= 0) continue
-        const marginPx = 240
-        if (rect.bottom < -marginPx) continue
-        if (rect.top > window.innerHeight + marginPx) continue
-      } catch {
-        return true
-      }
-      return true
-    }
-    return false
-  } catch {
-    return false
-  }
-}
-
-async function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  if (!Number.isFinite(ms) || ms <= 0) return
-  await new Promise<void>((resolve, reject) => {
-    if (signal.aborted) return reject(new DOMException('aborted', 'AbortError'))
-    const t = window.setTimeout(resolve, ms)
-    signal.addEventListener(
-      'abort',
-      () => {
-        window.clearTimeout(t)
-        reject(new DOMException('aborted', 'AbortError'))
-      },
-      { once: true }
-    )
-  })
-}
-
-async function collectByScrolling<T>(options: {
-  signal: AbortSignal
-  config?: Partial<DomSnapshotScrollConfig>
-  collectOnce: () => Map<unknown, T>
-  onProgress?: (info: { done: number; message: string }) => void
-}): Promise<Map<unknown, T>> {
-  const cfg: DomSnapshotScrollConfig = {
-    stepPx: clampInt(options.config?.stepPx ?? 400, 50, 5000, 400),
-    delayMs: clampInt(options.config?.delayMs ?? 2500, 0, 60_000, 2500),
-    stableThreshold: clampInt(options.config?.stableThreshold ?? 8, 1, 60, 8),
-    maxScrollCount: clampInt(options.config?.maxScrollCount ?? 1000, 50, 20_000, 1000),
-    collectIntervalMs: clampInt(options.config?.collectIntervalMs ?? 300, 0, 10_000, 300),
-    scrollToTop: options.config?.scrollToTop ?? true,
-  }
-
-  const startX = window.scrollX
-  const startY = window.scrollY
-
-  const merged = new Map<unknown, T>()
-  const merge = (m: Map<unknown, T>) => {
-    for (const [k, v] of m) if (!merged.has(k)) merged.set(k, v)
-  }
-
-  const isAtBottom = () => window.innerHeight + window.scrollY >= getDocumentScrollHeight() - 220
-  const hasSpinner = () => {
-    const userStream = document.querySelector<HTMLElement>('.user-stream')
-    if (userStream && hasVisibleMatch('.spinner', userStream)) return true
-    return hasVisibleMatch('.loading-container .spinner')
-  }
-
-  try {
-    if (cfg.scrollToTop) {
-      window.scrollTo(startX, 0)
-      await sleep(240, options.signal)
-    }
-
-    let stable = 0
-    let sizeStable = 0
-    let spinnerStable = 0
-    let scrollStable = 0
-    let lastSize = 0
-    let lastScrollY = window.scrollY
-
-    for (let i = 0; i < cfg.maxScrollCount; i += 1) {
-      if (options.signal.aborted) throw new DOMException('aborted', 'AbortError')
-
-      merge(options.collectOnce())
-      const size = merged.size
-      const spinner = hasSpinner()
-      const atBottom = isAtBottom()
-      const scrollY = window.scrollY
-
-      if (size === lastSize) sizeStable += 1
-      else sizeStable = 0
-
-      if (size === lastSize && !spinner) stable += 1
-      else stable = 0
-
-      if (size === lastSize && spinner) spinnerStable += 1
-      else spinnerStable = 0
-
-      if (Math.abs(scrollY - lastScrollY) < 2) scrollStable += 1
-      else scrollStable = 0
-
-      lastSize = size
-      lastScrollY = scrollY
-
-      options.onProgress?.({ done: size, message: `DOM 滚动收集… 已收集 ${size}` })
-
-      const shouldStop = stable >= cfg.stableThreshold && atBottom && !spinner
-      const shouldForceStop =
-        (scrollStable >= cfg.stableThreshold && sizeStable >= cfg.stableThreshold && !spinner) ||
-        (atBottom && sizeStable >= cfg.stableThreshold && spinnerStable >= cfg.stableThreshold * 2)
-      if (shouldStop || shouldForceStop) break
-
-      window.scrollBy(0, cfg.stepPx)
-      if (cfg.collectIntervalMs > 0) await sleep(cfg.collectIntervalMs, options.signal)
-      const remaining = Math.max(0, cfg.delayMs - cfg.collectIntervalMs)
-      if (remaining > 0) await sleep(remaining, options.signal)
-    }
-
-    merge(options.collectOnce())
-    return merged
-  } finally {
-    try {
-      window.scrollTo(startX, startY)
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
 export async function collectUserActivityEntries(options: {
   origin: string
   username: string | null
   mode: 'visible' | 'scroll'
   signal: AbortSignal
-  scrollConfig?: Partial<DomSnapshotScrollConfig>
+  scrollConfig?: Partial<SharedDomScrollConfig>
   onProgress?: (message: string) => void
 }): Promise<UserActivityEntry[]> {
   const passive = getPassiveUserActivityOuterHtmlCache(options.username)
@@ -346,8 +188,21 @@ export async function collectUserActivityEntries(options: {
       ? await collectByScrolling({
           signal: options.signal,
           config: { ...options.scrollConfig, scrollToTop: true },
+          defaultConfig: {
+            stepPx: 400,
+            delayMs: 2500,
+            stableThreshold: 8,
+            maxScrollCount: 1000,
+            collectIntervalMs: 300,
+            scrollToTop: true,
+          },
           collectOnce: collectVisibleUserActivityOuterHtml,
-          onProgress: (p) => options.onProgress?.(`${p.message} 条`),
+          hasSpinner: () => {
+            const userStream = document.querySelector<HTMLElement>('.user-stream')
+            if (userStream && hasVisibleMatch('.spinner', userStream)) return true
+            return hasVisibleMatch('.loading-container .spinner')
+          },
+          onProgress: (state) => options.onProgress?.(`DOM 滚动收集… 已收集 ${state.done} 条`),
         })
       : cachedVisible()
 

@@ -72,3 +72,16 @@ export async function downloadJson(options: {
     mime: 'application/json;charset=utf-8',
   })
 }
+
+export async function downloadMarkdown(options: {
+  filenameBase: string
+  markdown: string
+}): Promise<void> {
+  const name = sanitizeFilename(options.filenameBase)
+  const filename = name.toLowerCase().endsWith('.md') ? name : `${name}.md`
+  await downloadTextFile({
+    filename,
+    content: options.markdown,
+    mime: 'text/markdown;charset=utf-8',
+  })
+}

@@ -23,6 +23,11 @@ export type AssetInlineMetrics = {
   gmFail: number
 }
 
+export type AssetInlineFailure = {
+  url: string
+  reason: string
+}
+
 function isInlineableUrl(url: string): boolean {
   if (!url) return false
   if (url.startsWith('data:')) return false
@@ -358,7 +363,7 @@ function replaceAssetsInPost(
 export async function inlineAssets(
   data: TopicData,
   options: AssetInlineOptions & { signal: AbortSignal }
-): Promise<{ data: TopicData; metrics: AssetInlineMetrics }> {
+): Promise<{ data: TopicData; metrics: AssetInlineMetrics; failures: AssetInlineFailure[] }> {
   if (options.policy === 'none') {
     return {
       data,
@@ -373,6 +378,7 @@ export async function inlineAssets(
         gmOk: 0,
         gmFail: 0,
       },
+      failures: [],
     }
   }
 
@@ -401,6 +407,7 @@ export async function inlineAssets(
     gmOk: 0,
     gmFail: 0,
   }
+  const failures: AssetInlineFailure[] = []
 
   await runWithConcurrency(uniqueUrls, options.concurrency, async (url) => {
     if (options.signal.aborted) throw new DOMException('aborted', 'AbortError')
@@ -444,6 +451,10 @@ export async function inlineAssets(
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') throw err
       metrics.failed += 1
+      failures.push({
+        url,
+        reason: err instanceof Error && err.message ? err.message : 'inline failed',
+      })
     } finally {
       if (!options.signal.aborted) {
         // Throttle only when we had to hit network/GM (cache hits should stay fast).
@@ -467,5 +478,6 @@ export async function inlineAssets(
   return {
     data: { ...data, posts },
     metrics,
+    failures,
   }
 }

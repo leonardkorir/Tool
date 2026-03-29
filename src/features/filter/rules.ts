@@ -1,3 +1,5 @@
+import { canonicalTagKey, isNoTagToken } from './tagTokens'
+
 export type Level = 'public' | 'lv1' | 'lv2' | 'lv3'
 export type FilterMode = 'strict' | 'loose'
 
@@ -9,6 +11,10 @@ export type FilterConfig = {
   categoriesExclude: number[]
   tagsInclude: string[]
   tagsExclude: string[]
+  homeSourceEnabled: boolean
+  homeSourceCategories: number[]
+  homeSourceTags: string[]
+  homeSourceCollapsedByDefault: boolean
   blockedUsers: string[]
   showBlockedPostsInTopic: boolean
   autoLoadMore: boolean
@@ -31,11 +37,6 @@ function intersects<T>(a: T[], b: Set<T>): boolean {
   return false
 }
 
-function isNoTagToken(tag: string): boolean {
-  const t = tag.trim().toLowerCase()
-  return t === '无标签' || t === 'no_tag' || t === '__no_tag__'
-}
-
 export function shouldShowTopic(meta: TopicMeta, cfg: FilterConfig): boolean {
   const blockedUsers = toSet(cfg.blockedUsers.map((u) => u.trim().toLowerCase()).filter(Boolean))
   const authorUsername = meta.authorUsername?.trim().toLowerCase() ?? ''
@@ -53,15 +54,15 @@ export function shouldShowTopic(meta: TopicMeta, cfg: FilterConfig): boolean {
   )
   if (catCandidates.some((n) => catsEx.has(n))) return false
 
-  const tagsLower = meta.tags.map((t) => t.toLowerCase())
+  const tagsLower = meta.tags.map((t) => canonicalTagKey(t)).filter(Boolean)
   const noTags = meta.tags.length === 0
-  const tagsExTokens = cfg.tagsExclude.map((t) => t.toLowerCase())
+  const tagsExTokens = cfg.tagsExclude.map((t) => canonicalTagKey(t)).filter(Boolean)
   const excludeNoTags = tagsExTokens.some(isNoTagToken)
   const tagsEx = toSet(tagsExTokens.filter((t) => !isNoTagToken(t)))
   if ((excludeNoTags && noTags) || intersects(tagsLower, tagsEx)) return false
 
   const catsInc = toSet(cfg.categoriesInclude)
-  const tagsIncTokens = cfg.tagsInclude.map((t) => t.toLowerCase())
+  const tagsIncTokens = cfg.tagsInclude.map((t) => canonicalTagKey(t)).filter(Boolean)
   const includeNoTags = tagsIncTokens.some(isNoTagToken)
   const tagsInc = toSet(tagsIncTokens.filter((t) => !isNoTagToken(t)))
   const hasCatInc = catsInc.size > 0

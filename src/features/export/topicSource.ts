@@ -5,6 +5,12 @@ import { tryGetTopicJsonFromDataPreloaded } from '../../platform/discourse/prelo
 import type { ExportProgress, TopicData } from './types'
 import { normalizeTopicData } from './transform'
 import { getPassiveTopicPostOuterHtmlCache } from './domPassiveCache'
+import {
+  clampScrollInt,
+  collectByScrolling,
+  hasVisibleMatch,
+  sleepWithAbort,
+} from './scrolling'
 
 export type TopicLoadMode = 'auto' | 'api' | 'dom-visible' | 'dom-scroll'
 
@@ -67,21 +73,6 @@ function getTopicPostCountHint(topicId: number): number | null {
   }
 
   return hint && hint > 0 ? hint : null
-}
-
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) return reject(new DOMException('aborted', 'AbortError'))
-    const t = setTimeout(() => resolve(), ms)
-    signal.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(t)
-        reject(new DOMException('aborted', 'AbortError'))
-      },
-      { once: true }
-    )
-  })
 }
 
 function parsePostNumberFromHref(href: string): number | null {
@@ -307,12 +298,6 @@ function loadTopicDataFromDom(options: {
   return normalizeTopicData({ origin, topicJson, posts: posts as unknown as DiscoursePost[] })
 }
 
-function clampInt(value: number, min: number, max: number, fallback: number): number {
-  if (!Number.isFinite(value)) return fallback
-  const n = Math.floor(value)
-  return Math.min(max, Math.max(min, n))
-}
-
 async function loadTopicDataFromDomByScrolling(options: {
   origin: string
   topicId: number
@@ -323,24 +308,8 @@ async function loadTopicDataFromDomByScrolling(options: {
 }): Promise<TopicData | null> {
   const { origin, topicId, slug, signal, onProgress } = options
 
-  const startX = window.scrollX
-  const startY = window.scrollY
-
   const title = document.title?.trim() || `topic_${topicId}`
-  const byPostNumber = new Map<number, DiscoursePost>()
   const totalHint = getTopicPostCountHint(topicId)
-
-  const collect = (): number => {
-    const rendered = collectRenderedTopicPosts()
-    let added = 0
-    for (const p of rendered) {
-      if (!byPostNumber.has(p.post_number)) {
-        byPostNumber.set(p.post_number, p as unknown as DiscoursePost)
-        added += 1
-      }
-    }
-    return added
-  }
 
   const countCloaked = (): number => {
     const root =
@@ -354,126 +323,99 @@ async function loadTopicDataFromDomByScrolling(options: {
     }
   }
 
-  const isAtBottom = (): boolean =>
-    window.innerHeight + window.scrollY >= document.body.scrollHeight - 220
   const hasSpinner = (): boolean => {
-    const selector = '.spinner, .loading-container, .topic-timeline .spinner, .user-stream .spinner'
-    try {
-      const nodes = Array.from(document.querySelectorAll(selector))
-      for (const el of nodes) {
-        if (el instanceof HTMLElement) {
-          const style = window.getComputedStyle(el)
-          if (style.display === 'none') continue
-          if (style.visibility === 'hidden') continue
-          if (style.opacity === '0') continue
-        }
-        try {
-          const rect = el.getBoundingClientRect()
-          if (rect.width <= 0 || rect.height <= 0) continue
-          const marginPx = 240
-          if (rect.bottom < -marginPx) continue
-          if (rect.top > window.innerHeight + marginPx) continue
-        } catch {
-          // If we can't measure, conservatively treat it as active.
-          return true
-        }
-        return true
-      }
-      return false
-    } catch {
-      return false
-    }
+    const stream =
+      document.querySelector<HTMLElement>('div.post-stream') ??
+      document.querySelector<HTMLElement>('#post-stream')
+    if (hasVisibleMatch('.loading-container .spinner')) return true
+    if (hasVisibleMatch('.topic-timeline .spinner')) return true
+    return stream ? hasVisibleMatch('.spinner', stream) : false
   }
 
-  try {
-    const cfg: DomScrollConfig = {
-      stepPx: clampInt(options.config?.stepPx ?? 450, 50, 5000, 450),
-      delayMs: clampInt(options.config?.delayMs ?? 850, 0, 60_000, 850),
-      stableThreshold: clampInt(options.config?.stableThreshold ?? 10, 1, 60, 10),
-      maxScrollCount: clampInt(options.config?.maxScrollCount ?? 1200, 50, 20_000, 1200),
-      collectIntervalMs: clampInt(options.config?.collectIntervalMs ?? 320, 0, 10_000, 320),
-      // v1 parity: full export should always start from top (we restore scroll position afterwards).
+  const byPostNumber = await collectByScrolling<DiscoursePost>({
+    signal,
+    config: { ...options.config, scrollToTop: true },
+    defaultConfig: {
+      stepPx: 450,
+      delayMs: 850,
+      stableThreshold: 10,
+      maxScrollCount: 1200,
+      collectIntervalMs: 320,
       scrollToTop: true,
-    }
-
-    if (cfg.scrollToTop) {
-      window.scrollTo(startX, 0)
-      await sleep(240, signal)
-    }
-
-    let stable = 0
-    const baseStepPx = cfg.stepPx
-    const baseDelayMs = cfg.delayMs
-    let stepPx = cfg.stepPx
-    let delayMs = cfg.delayMs
-
-    for (let i = 0; i < cfg.maxScrollCount; i += 1) {
-      if (signal.aborted) throw new DOMException('aborted', 'AbortError')
-
-      const added = collect()
-      if (added > 0) stable = 0
-      else stable += 1
-
+    },
+    collectOnce: () => {
+      const rendered = collectRenderedTopicPosts()
+      const next = new Map<number, DiscoursePost>()
+      for (const post of rendered) next.set(post.post_number, post as unknown as DiscoursePost)
+      return next
+    },
+    hasSpinner,
+    onProgress: (state) => {
       const cloaked = countCloaked()
-      const spinner = hasSpinner()
       onProgress?.({
         stage: 'posts',
-        done: byPostNumber.size,
+        done: state.done,
         total: totalHint ?? undefined,
         message: totalHint
-          ? `DOM 滚动收集… 已收集 ${byPostNumber.size}/${totalHint} 楼（cloaked ${cloaked}）`
-          : `DOM 滚动收集… 已收集 ${byPostNumber.size} 楼（cloaked ${cloaked}）`,
+          ? `DOM 滚动收集… 已收集 ${state.done}/${totalHint} 楼（cloaked ${cloaked}）`
+          : `DOM 滚动收集… 已收集 ${state.done} 楼（cloaked ${cloaked}）`,
       })
-
-      if (totalHint && byPostNumber.size >= totalHint) break
-      if (stable >= cfg.stableThreshold && (isAtBottom() || cloaked === 0) && !spinner) break
-
-      // Adaptive scroll pacing:
-      // - If a spinner is visible, slow down and reduce step to avoid "scrolling past" load triggers.
-      // - Otherwise, gradually recover towards base, and nudge step up when nothing new is collected.
-      if (spinner) {
-        delayMs = clampInt(Math.max(delayMs, baseDelayMs) + 450, 0, 60_000, baseDelayMs)
-        stepPx = clampInt(Math.floor(stepPx * 0.88), 50, 5000, baseStepPx)
-      } else {
-        delayMs = clampInt(Math.floor(delayMs * 0.92), baseDelayMs, 60_000, baseDelayMs)
-        const bump = added > 0 ? 1.03 : stable >= 2 ? 1.07 : 1.02
-        stepPx = clampInt(Math.floor(stepPx * bump), 50, 5000, baseStepPx)
+    },
+    shouldStop: (state) => {
+      if (totalHint && state.done >= totalHint) return true
+      const cloaked = countCloaked()
+      return state.stable >= state.stableThreshold && (state.atBottom || cloaked === 0) && !state.spinner
+    },
+    getNextTiming: (state) => {
+      if (state.spinner) {
+        return {
+          delayMs: clampScrollInt(
+            Math.max(state.delayMs, state.baseDelayMs) + 450,
+            0,
+            60_000,
+            state.baseDelayMs
+          ),
+          stepPx: clampScrollInt(
+            Math.floor(state.stepPx * 0.88),
+            50,
+            5000,
+            state.baseStepPx
+          ),
+        }
       }
+      const bump = state.added > 0 ? 1.03 : state.stable >= 2 ? 1.07 : 1.02
+      return {
+        delayMs: clampScrollInt(
+          Math.floor(state.delayMs * 0.92),
+          state.baseDelayMs,
+          60_000,
+          state.baseDelayMs
+        ),
+        stepPx: clampScrollInt(
+          Math.floor(state.stepPx * bump),
+          50,
+          5000,
+          state.baseStepPx
+        ),
+      }
+    },
+  })
 
-      window.scrollBy(0, stepPx)
-      if (cfg.collectIntervalMs > 0) await sleep(cfg.collectIntervalMs, signal)
-      collect()
+  if (byPostNumber.size === 0) return null
 
-      const remaining = Math.max(0, delayMs - cfg.collectIntervalMs)
-      if (remaining > 0) await sleep(remaining, signal)
-    }
+  const posts = Array.from(byPostNumber.values()).sort((a, b) => a.post_number - b.post_number)
+  const topicJson = {
+    id: topicId,
+    title,
+    slug,
+    posts_count: posts.length,
+    post_stream: {
+      stream: posts.map((p) => p.id),
+      posts,
+    },
+  } satisfies DiscourseTopicJson
 
-    // Final sweep after stopping.
-    collect()
-
-    if (byPostNumber.size === 0) return null
-
-    const posts = Array.from(byPostNumber.values()).sort((a, b) => a.post_number - b.post_number)
-    const topicJson = {
-      id: topicId,
-      title,
-      slug,
-      posts_count: posts.length,
-      post_stream: {
-        stream: posts.map((p) => p.id),
-        posts,
-      },
-    } satisfies DiscourseTopicJson
-
-    return normalizeTopicData({ origin, topicJson, posts })
-  } finally {
-    // Best-effort restore view.
-    try {
-      window.scrollTo(startX, startY)
-    } catch {
-      /* ignore */
-    }
-  }
+  return normalizeTopicData({ origin, topicJson, posts })
 }
 
 export async function loadTopicData(options: {
@@ -544,7 +486,7 @@ export async function loadTopicData(options: {
     throw new Error('DOM 滚动导出失败：未收集到任何楼层')
   }
 
-  const baseDelayMs = clampInt(Number(options.networkDelayMs ?? 800), 0, 10_000, 800)
+  const baseDelayMs = clampScrollInt(Number(options.networkDelayMs ?? 800), 0, 10_000, 800)
   let adaptiveDelayMs = baseDelayMs
 
   let topicJson: DiscourseTopicJson
@@ -595,7 +537,7 @@ export async function loadTopicData(options: {
       }
     }
 
-    onProgress?.({ stage: 'topic', message: 'DOM 滚动导出不可用，尝试 DOM 快照…' })
+    onProgress?.({ stage: 'topic', message: 'DOM 滚动导出不可用，尝试当前已渲染楼层兜底…' })
     const fallback = loadTopicDataFromDom({ origin, topicId, slug })
     if (fallback) {
       onProgress?.({
@@ -683,7 +625,7 @@ export async function loadTopicData(options: {
               total,
               message: `429 限流，等待 ${waitMs} 毫秒后重试…`,
             })
-            await sleep(waitMs, signal)
+            await sleepWithAbort(waitMs, signal)
             continue
           }
           throw err
@@ -699,7 +641,7 @@ export async function loadTopicData(options: {
       onProgress?.({ stage: 'posts', done, total })
       const jitterMs = adaptiveDelayMs > 0 ? Math.floor(Math.random() * 240) : 0
       const waitMs = adaptiveDelayMs + jitterMs
-      await sleep(waitMs, signal)
+      await sleepWithAbort(waitMs, signal)
     }
   }
 

@@ -30,8 +30,6 @@ type AutoReadConfig = {
   continueWhenHidden: boolean
   autoLikeEnabled: boolean
   autoLikeProbability: number
-  autoLikeDailyLimit: number
-  autoLikeLimitPerTopic: boolean
 }
 
 type TopicSource = 'unread' | 'new' | 'latest'
@@ -49,6 +47,10 @@ type PendingAutoLike = {
   postId: number | null
   target: HTMLElement | null
 }
+type LikeCandidate = {
+  postId: number
+  target: HTMLElement
+}
 
 const FEATURE_ID = 'ld2-autoRead'
 
@@ -57,10 +59,7 @@ const KEY_STATE = 'read.state'
 const KEY_CFG = 'read.config'
 const KEY_QUEUE = 'read.queue'
 const KEY_VISITED = 'read.visited'
-const KEY_LIKE_DATE = 'read.like.date'
 const KEY_LIKE_COUNT = 'read.like.count'
-const KEY_LIKE_AUTO_COUNT = 'read.like.autoCount'
-const KEY_LIKE_NEXT_AT = 'read.like.nextAt'
 
 const VISITED_TTL_MS = 30 * 60_000
 
@@ -98,20 +97,13 @@ function randInt(min: number, max: number): number {
   return lo + Math.floor(Math.random() * (hi - lo + 1))
 }
 
-function todayKey(): string {
-  const d = new Date()
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
-}
-
 async function fetchLatestTopicsPage(options: {
   origin: string
   source: TopicSource
   page: number
   commentLimit: number
   signal: AbortSignal
+  onSkip?: (message: string) => void
 }): Promise<TopicRef[]> {
   const url = `${options.origin}/${options.source}.json?no_definitions=true&page=${options.page}`
   const res = await fetch(url, { signal: options.signal, credentials: 'include' })
@@ -142,8 +134,10 @@ async function fetchLatestTopicsPage(options: {
         : Number.isFinite(postsCount)
           ? postsCount
           : null
-    if (Number.isFinite(limit) && limit > 0 && maxPostNumber != null && maxPostNumber >= limit)
+    if (Number.isFinite(limit) && limit > 0 && maxPostNumber != null && maxPostNumber >= limit) {
+      options.onSkip?.(`跳过 #${id}：楼层 ${maxPostNumber} ≥ 阈值 ${limit}`)
       continue
+    }
 
     const lastReadRaw = t?.last_read_post_number
     const lastRead = Number.parseInt(String(lastReadRaw ?? ''), 10)
@@ -328,9 +322,16 @@ function isProbablyLikeAction(target: HTMLElement): boolean {
   return hint.includes('like')
 }
 
-function findRandomLikeTarget(): HTMLElement | null {
+function getLikeTargetPostId(target: HTMLElement): number | null {
+  const article = target.closest<HTMLElement>('article[data-post-id]')
+  const postId = Number.parseInt(String(article?.getAttribute('data-post-id') ?? ''), 10)
+  return Number.isFinite(postId) && postId > 0 ? postId : null
+}
+
+function collectLikeCandidates(processedPostIds?: ReadonlySet<number>): LikeCandidate[] {
   const root = document.querySelector<HTMLElement>('div.post-stream') ?? document
   const candidates: HTMLElement[] = []
+  const candidatePostIds = new Set<number>()
   const articles = Array.from(root.querySelectorAll<HTMLElement>('article[data-post-id]'))
   for (const article of articles) {
     if (article.classList.contains('my-post')) continue
@@ -340,11 +341,23 @@ function findRandomLikeTarget(): HTMLElement | null {
       if (!isProbablyLikeAction(target)) continue
       if (!isVisibleLikeTarget(target)) continue
       if (isLikeTargetPressed(target)) continue
+      const postId = getLikeTargetPostId(target)
+      if (postId == null) continue
+      if (processedPostIds?.has(postId)) continue
+      if (candidatePostIds.has(postId)) continue
+      candidatePostIds.add(postId)
       candidates.push(target)
     }
   }
-  if (candidates.length === 0) return null
+  return candidates.map((target) => ({
+    postId: getLikeTargetPostId(target) as number,
+    target,
+  }))
+}
 
+function findRandomLikeCandidate(processedPostIds?: ReadonlySet<number>): LikeCandidate | null {
+  const candidates = collectLikeCandidates(processedPostIds)
+  if (candidates.length === 0) return null
   return candidates[Math.floor(Math.random() * candidates.length)] ?? null
 }
 
@@ -398,8 +411,6 @@ export function autoReadFeature(): Feature {
         continueWhenHidden: true,
         autoLikeEnabled: false,
         autoLikeProbability: 0.1,
-        autoLikeDailyLimit: 30,
-        autoLikeLimitPerTopic: false,
       }
 
       function readConfig(): AutoReadConfig {
@@ -444,24 +455,19 @@ export function autoReadFeature(): Feature {
             1,
             cfgDefault.autoLikeProbability
           ),
-          autoLikeDailyLimit: clampInt(
-            cfg.autoLikeDailyLimit,
-            0,
-            500,
-            cfgDefault.autoLikeDailyLimit
-          ),
-          autoLikeLimitPerTopic: !!cfg.autoLikeLimitPerTopic,
         }
       }
 
       function writeConfig(cfg: AutoReadConfig): void {
         ctx.storage.set(KEY_CFG, cfg)
         emitUiRefresh()
+        renderRuntimeInfo()
       }
 
       function setStatus(text: string): void {
         status.textContent = text
         emitUiRefresh()
+        setRuntimeNote(text)
       }
 
       const startBtn = createButton({ text: '开始', className: 'btn primary' })
@@ -485,6 +491,12 @@ export function autoReadFeature(): Feature {
       likeInfo.style.fontSize = '12px'
       likeInfo.style.lineHeight = '1.5'
       likeInfo.style.marginTop = '6px'
+
+      const runtimeInfo = document.createElement('div')
+      runtimeInfo.className = 'ld2-inline-help ld2-muted'
+      runtimeInfo.style.fontSize = '12px'
+      runtimeInfo.style.lineHeight = '1.5'
+      runtimeInfo.style.marginTop = '6px'
 
       const stepMinInput = createNumberInput({
         min: 10,
@@ -647,30 +659,6 @@ export function autoReadFeature(): Feature {
       likeProbabilityInput.placeholder = '0.10'
       likeProbabilityInput.setAttribute('aria-label', '自动点赞概率（0-1）')
 
-      const likeDailyLimitInput = document.createElement('input')
-      likeDailyLimitInput.type = 'number'
-      likeDailyLimitInput.min = '0'
-      likeDailyLimitInput.max = '500'
-      likeDailyLimitInput.step = '1'
-      likeDailyLimitInput.placeholder = '30'
-      likeDailyLimitInput.setAttribute('aria-label', '自动点赞每日上限（次）')
-
-      const likeAdvRange = document.createElement('div')
-      likeAdvRange.className = 'stack ld2-pair-grid'
-      likeAdvRange.appendChild(likeProbabilityInput)
-      likeAdvRange.appendChild(likeDailyLimitInput)
-
-      const likeLimitPerTopicLabel = document.createElement('label')
-      likeLimitPerTopicLabel.style.display = 'flex'
-      likeLimitPerTopicLabel.style.alignItems = 'center'
-      likeLimitPerTopicLabel.style.gap = '8px'
-      likeLimitPerTopicLabel.style.fontSize = '12px'
-
-      const likeLimitPerTopicCb = document.createElement('input')
-      likeLimitPerTopicCb.type = 'checkbox'
-      likeLimitPerTopicLabel.appendChild(likeLimitPerTopicCb)
-      likeLimitPerTopicLabel.appendChild(document.createTextNode('限制同一话题只点一次'))
-
       advWrap.appendChild(
         createRow({
           title: '用户操作暂停（毫秒）',
@@ -721,14 +709,8 @@ export function autoReadFeature(): Feature {
       )
       advWrap.appendChild(
         createRow({
-          title: '点赞（概率 / 上限）',
-          right: likeAdvRange,
-        })
-      )
-      advWrap.appendChild(
-        createRow({
-          title: '同话题仅点一次',
-          right: likeLimitPerTopicLabel,
+          title: '点赞概率',
+          right: likeProbabilityInput,
         })
       )
       advanced.appendChild(advWrap)
@@ -798,6 +780,7 @@ export function autoReadFeature(): Feature {
       controls.appendChild(advanced)
       controls.appendChild(likeLabel)
       controls.appendChild(likeInfo)
+      controls.appendChild(runtimeInfo)
 
       let state: AutoReadState = 'idle'
       let timer: number | null = null
@@ -808,13 +791,14 @@ export function autoReadFeature(): Feature {
       let bottomArrivedAt = 0
       let bottomPauseMs = 0
       let lastTopicId: number | null = null
-      let lastAutoLikeTopicId: number | null = null
       let lastActivityAt = 0
       let likePlannedTopicId: number | null = null
       let likeTriggerAtMs = 0
       let likeTriggerMinRenderedPosts = 0
+      const handledAutoLikePostIds = new Set<number>()
       let pendingAutoLike: PendingAutoLike | null = null
       let pendingAutoLikeConfirmTimer: number | null = null
+      let autoLikeStoppedReason: string | null = null
       let pendingTopicExpectation: { topicId: number; maxPostNumber: number | null } | null = null
       let currentTopicExpectedMaxPostNumber: number | null = null
       let lastRenderedHighestPostNumber = 0
@@ -825,6 +809,39 @@ export function autoReadFeature(): Feature {
       let topicDomObservedTopicId: number | null = null
       let topicDomObserver: MutationObserver | null = null
       let topicDomObserverRetryTimer: number | null = null
+      let runtimeLastNote = '待命'
+      const runtimeSkipNotes: string[] = []
+
+      function pushRuntimeSkip(message: string): void {
+        const text = String(message || '').trim()
+        if (!text) return
+        runtimeLastNote = text
+        runtimeSkipNotes.unshift(text)
+        if (runtimeSkipNotes.length > 3) runtimeSkipNotes.length = 3
+        renderRuntimeInfo()
+      }
+
+      function setRuntimeNote(message: string): void {
+        const text = String(message || '').trim()
+        if (!text) return
+        runtimeLastNote = text
+        renderRuntimeInfo()
+      }
+
+      function renderRuntimeInfo(): void {
+        const queue = ctx.storage.get(KEY_QUEUE, [] as TopicRef[])
+        const visited = ctx.storage.get(KEY_VISITED, [] as VisitedTopic[])
+        const route = ctx.discourse.getRouteInfo()
+        const pieces = [
+          `状态 ${state}`,
+          `队列 ${Array.isArray(queue) ? queue.length : 0}`,
+          `已访问 ${Array.isArray(visited) ? visited.length : 0}`,
+          route.isTopic && route.topicId ? `当前 #${route.topicId}` : '当前列表页',
+        ]
+        runtimeInfo.textContent = `${pieces.join(' · ')} · 最近：${runtimeLastNote}${
+          runtimeSkipNotes.length > 0 ? ` · 跳过：${runtimeSkipNotes.join('；')}` : ''
+        }`
+      }
 
       function normalizeVisited(raw: unknown): VisitedTopic[] {
         const out: VisitedTopic[] = []
@@ -1032,6 +1049,19 @@ export function autoReadFeature(): Feature {
         clearPendingAutoLikeConfirmTimer()
       }
 
+      function clearHandledAutoLikePosts(): void {
+        handledAutoLikePostIds.clear()
+      }
+
+      function markAutoLikePostHandled(postId: number | null): void {
+        if (!Number.isFinite(postId) || postId == null || postId <= 0) return
+        handledAutoLikePostIds.add(postId)
+      }
+
+      function getRemainingAutoLikeCandidateCount(): number {
+        return collectLikeCandidates(handledAutoLikePostIds).length
+      }
+
       function findLikeArticle(postId: number | null): HTMLElement | null {
         if (!Number.isFinite(postId) || postId == null || postId <= 0) return null
         return document.querySelector<HTMLElement>(`article[data-post-id="${postId}"]`)
@@ -1060,8 +1090,7 @@ export function autoReadFeature(): Feature {
           const pending = pendingAutoLike
           if (!pending) return
           if (pending.expiresAt <= Date.now()) {
-            clearPendingAutoLike()
-            refreshLikeInfo(cfg)
+            handleLikeFailed(cfg)
             return
           }
           if (isPendingAutoLikeConfirmed(pending)) {
@@ -1078,17 +1107,13 @@ export function autoReadFeature(): Feature {
         likePlannedTopicId = null
         likeTriggerAtMs = 0
         likeTriggerMinRenderedPosts = 0
+        clearHandledAutoLikePosts()
         clearPendingAutoLike()
-      }
-
-      function isPerTopicAutoLikeBlocked(cfg: AutoReadConfig, topicId: number | null): boolean {
-        return cfg.autoLikeLimitPerTopic && topicId != null && lastAutoLikeTopicId === topicId
       }
 
       function planAutoLikeForTopic(topicId: number, cfg: AutoReadConfig): void {
         clearAutoLikePlan()
         if (!cfg.autoLikeEnabled) return
-        if (isPerTopicAutoLikeBlocked(cfg, topicId)) return
         if (!canAutoLike(cfg)) return
         if (cfg.autoLikeProbability <= 0) return
         likePlannedTopicId = topicId
@@ -1235,6 +1260,7 @@ export function autoReadFeature(): Feature {
               page: p,
               commentLimit: cfg.commentLimit,
               signal,
+              onSkip: pushRuntimeSkip,
             })
             for (const t of topics) pushIfEligible(t)
             if (p < pages) {
@@ -1312,51 +1338,6 @@ export function autoReadFeature(): Feature {
         lastActivityAt = Date.now()
       }
 
-      function nextMidnightMs(now = new Date()): number {
-        const d = new Date(now.getTime())
-        d.setHours(24, 0, 0, 0)
-        return d.getTime()
-      }
-
-      function formatLocalDateTime(ms: number): string {
-        try {
-          return new Date(ms).toLocaleString('zh-CN', {
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit',
-            hour: '2-digit',
-            minute: '2-digit',
-          })
-        } catch {
-          return String(ms)
-        }
-      }
-
-      function ensureLikeState(): {
-        day: string
-        count: number
-        autoCount: number
-        nextAtMs: number | null
-      } {
-        const day = todayKey()
-        const storedDay = ctx.storage.get(KEY_LIKE_DATE, '')
-        if (storedDay !== day) {
-          ctx.storage.set(KEY_LIKE_DATE, day)
-          ctx.storage.set(KEY_LIKE_COUNT, 0)
-          ctx.storage.set(KEY_LIKE_AUTO_COUNT, 0)
-          ctx.storage.remove(KEY_LIKE_NEXT_AT)
-        }
-        const countRaw = Number(ctx.storage.get(KEY_LIKE_COUNT, 0))
-        const count = Number.isFinite(countRaw) && countRaw > 0 ? Math.floor(countRaw) : 0
-        const autoCountRaw = Number(ctx.storage.get(KEY_LIKE_AUTO_COUNT, 0))
-        const autoCount =
-          Number.isFinite(autoCountRaw) && autoCountRaw > 0 ? Math.floor(autoCountRaw) : 0
-        if (autoCount !== autoCountRaw) ctx.storage.set(KEY_LIKE_AUTO_COUNT, autoCount)
-        const nextAtRaw = Number(ctx.storage.get(KEY_LIKE_NEXT_AT, 0))
-        const nextAtMs = Number.isFinite(nextAtRaw) && nextAtRaw > 0 ? nextAtRaw : null
-        return { day, count, autoCount, nextAtMs }
-      }
-
       function parseRetryAfterMs(value: string | null | undefined): number | null {
         const v = String(value ?? '').trim()
         if (!v) return null
@@ -1368,14 +1349,13 @@ export function autoReadFeature(): Feature {
         return Number.isFinite(at) ? Math.max(0, at - Date.now()) : null
       }
 
-      function getRemainingAutoLikeQuota(cfg: AutoReadConfig): number {
-        if (cfg.autoLikeDailyLimit <= 0) return 0
-        return Math.max(0, cfg.autoLikeDailyLimit - ensureLikeState().autoCount)
+      function readLikeCount(): number {
+        const raw = Number(ctx.storage.get(KEY_LIKE_COUNT, 0))
+        return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0
       }
 
       function getCurrentTopicAutoLikeStatus(cfg: AutoReadConfig): string | null {
         if (!cfg.autoLikeEnabled) return null
-        if (cfg.autoLikeDailyLimit <= 0) return '自动点赞已禁用'
 
         const route = ctx.discourse.getRouteInfo()
         const pendingTopicId = getPendingAutoLikeTopicId()
@@ -1383,55 +1363,35 @@ export function autoReadFeature(): Feature {
           return pendingTopicId === route.topicId ? '本帖点赞提交中' : '点赞提交中'
         }
 
+        if (autoLikeStoppedReason) return autoLikeStoppedReason
         if (!route.isTopic || !route.topicId) return '进入话题后生效'
-        if (isPerTopicAutoLikeBlocked(cfg, route.topicId)) return '本帖已点过'
-        if (!canAutoLike(cfg)) {
-          if (getRemainingAutoLikeQuota(cfg) <= 0) return '今日上限已满'
-          return '冷却中'
-        }
         if (likePlannedTopicId !== route.topicId) return '本帖未计划'
 
         const { count: postCount } = getRenderedPostProgress()
         if (postCount < likeTriggerMinRenderedPosts) {
           return `本帖待点赞（等楼层 ${postCount}/${likeTriggerMinRenderedPosts}）`
         }
-        if (Date.now() < likeTriggerAtMs) return '本帖待点赞（等时机）'
-        if (!findRandomLikeTarget()) return '本帖暂无可点赞按钮'
-        return '本帖待点赞'
+        const remainingCandidateCount = getRemainingAutoLikeCandidateCount()
+        if (remainingCandidateCount === 0) return '当前已渲染楼层暂无可点赞按钮'
+        if (Date.now() < likeTriggerAtMs) return `本帖待点赞（剩余 ${remainingCandidateCount}）`
+        return `本帖待点赞（剩余 ${remainingCandidateCount}）`
       }
 
       function refreshLikeInfo(cfg: AutoReadConfig): void {
-        const { count, autoCount, nextAtMs } = ensureLikeState()
-
         const parts: string[] = []
         if (!cfg.autoLikeEnabled) parts.push('自动点赞：关闭')
-        else if (cfg.autoLikeDailyLimit <= 0) parts.push('自动点赞：已禁用（上限=0）')
         else parts.push('自动点赞：开启')
 
-        parts.push(`今日已赞 ${count}（本地）`)
-        parts.push(`自动已点 ${autoCount}/${cfg.autoLikeDailyLimit}`)
+        parts.push(`累计已赞 ${readLikeCount()}（本地）`)
 
         const currentTopicStatus = getCurrentTopicAutoLikeStatus(cfg)
         if (currentTopicStatus) parts.push(currentTopicStatus)
-
-        if (cfg.autoLikeDailyLimit > 0 && getRemainingAutoLikeQuota(cfg) <= 0) {
-          const next = nextAtMs && nextAtMs > Date.now() ? nextAtMs : nextMidnightMs()
-          if (!nextAtMs || nextAtMs !== next) ctx.storage.set(KEY_LIKE_NEXT_AT, next)
-          parts.push(`已达上限，下次 ${formatLocalDateTime(next)}`)
-        } else if (nextAtMs && nextAtMs > Date.now()) {
-          parts.push(`下次 ${formatLocalDateTime(nextAtMs)}`)
-        }
 
         likeInfo.textContent = parts.join(' · ')
       }
 
       function canAutoLike(cfg: AutoReadConfig): boolean {
-        if (!cfg.autoLikeEnabled) return false
-        const { autoCount, nextAtMs } = ensureLikeState()
-        if (nextAtMs && nextAtMs > Date.now()) return false
-        if (cfg.autoLikeDailyLimit <= 0) return false
-        if (autoCount >= cfg.autoLikeDailyLimit) return false
-        return true
+        return cfg.autoLikeEnabled && cfg.autoLikeProbability > 0 && !autoLikeStoppedReason
       }
 
       function getPendingAutoLikeTopicId(): number | null {
@@ -1446,33 +1406,31 @@ export function autoReadFeature(): Feature {
       function tryAutoLike(cfg: AutoReadConfig, postCount: number): void {
         const route = ctx.discourse.getRouteInfo()
         if (!route.topicId) return
-        if (isPerTopicAutoLikeBlocked(cfg, route.topicId)) return
         if (likePlannedTopicId !== route.topicId) return
         if (postCount < likeTriggerMinRenderedPosts) return
         if (Date.now() < likeTriggerAtMs) return
         if (!canAutoLike(cfg)) return
         if (getPendingAutoLikeTopicId() != null) return
 
-        const target = findRandomLikeTarget()
-        if (!target) {
+        const candidate = findRandomLikeCandidate(handledAutoLikePostIds)
+        if (!candidate) {
           refreshLikeInfo(cfg)
           return
         }
         if (Math.random() > cfg.autoLikeProbability) {
-          if (cfg.autoLikeLimitPerTopic) clearAutoLikePlan()
-          else planAutoLikeForTopic(route.topicId, cfg)
+          markAutoLikePostHandled(candidate.postId)
+          likeTriggerAtMs = Date.now() + 250
+          likeTriggerMinRenderedPosts = 0
           refreshLikeInfo(cfg)
           return
         }
 
-        triggerLikeClick(target)
-        const article = target.closest<HTMLElement>('article[data-post-id]')
-        const postId = Number.parseInt(String(article?.getAttribute('data-post-id') ?? ''), 10)
+        triggerLikeClick(candidate.target)
         pendingAutoLike = {
           topicId: route.topicId,
           expiresAt: Date.now() + 15_000,
-          postId: Number.isFinite(postId) && postId > 0 ? postId : null,
-          target,
+          postId: candidate.postId,
+          target: candidate.target,
         }
         schedulePendingAutoLikeConfirmation(cfg)
         likeTriggerAtMs = Date.now() + 1_500
@@ -1480,76 +1438,56 @@ export function autoReadFeature(): Feature {
       }
 
       function handleLikeSucceeded(cfg: AutoReadConfig, topicId: number | null): void {
-        const before = ensureLikeState()
+        const completed = pendingAutoLike
         clearPendingAutoLike()
-        if (topicId != null) lastAutoLikeTopicId = topicId
-        likePlannedTopicId = null
-        likeTriggerAtMs = 0
-        likeTriggerMinRenderedPosts = 0
-
-        // If we can like again, clear any previous cooldown.
-        if (before.nextAtMs && before.nextAtMs > Date.now()) ctx.storage.remove(KEY_LIKE_NEXT_AT)
-
-        const nextCount = before.count + 1
-        const nextAutoCount = before.autoCount + 1
-        ctx.storage.set(KEY_LIKE_COUNT, nextCount)
-        ctx.storage.set(KEY_LIKE_AUTO_COUNT, nextAutoCount)
-
-        const reachedScriptCap =
-          cfg.autoLikeEnabled &&
-          cfg.autoLikeDailyLimit > 0 &&
-          nextAutoCount >= cfg.autoLikeDailyLimit
-
-        if (reachedScriptCap) {
-          const nextAt = nextMidnightMs()
-          ctx.storage.set(KEY_LIKE_NEXT_AT, nextAt)
-          window.dispatchEvent(
-            new CustomEvent('ld2:toast', {
-              detail: {
-                title: '自动点赞已达上限',
-                desc: `${nextCount} · 下次 ${formatLocalDateTime(nextAt)}`,
-              },
-            })
-          )
-        } else if (!cfg.autoLikeLimitPerTopic && topicId != null) {
-          planAutoLikeForTopic(topicId, cfg)
+        if (topicId != null && likePlannedTopicId === topicId) {
+          markAutoLikePostHandled(completed?.postId ?? null)
+          likeTriggerAtMs = Date.now() + 1_500
+          likeTriggerMinRenderedPosts = 0
         }
+        const nextCount = readLikeCount() + 1
+        ctx.storage.set(KEY_LIKE_COUNT, nextCount)
         refreshLikeInfo(cfg)
+        if (topicId != null && ctx.discourse.getRouteInfo().topicId === topicId && state === 'running') {
+          requestTick()
+        }
       }
 
       function handleLikeRateLimited(cfg: AutoReadConfig, retryAfter: string | null): void {
-        const before = ensureLikeState()
         clearPendingAutoLike()
         likePlannedTopicId = null
         likeTriggerAtMs = 0
         likeTriggerMinRenderedPosts = 0
         const retryAfterMs = parseRetryAfterMs(retryAfter)
-        const nextAt = retryAfterMs != null ? Date.now() + retryAfterMs : nextMidnightMs()
-        ctx.storage.set(KEY_LIKE_NEXT_AT, nextAt)
+        autoLikeStoppedReason = '自动点赞已停止（触发限流）'
         refreshLikeInfo(cfg)
 
-        if (
-          !before.nextAtMs ||
-          before.nextAtMs < Date.now() ||
-          Math.abs(before.nextAtMs - nextAt) > 1500
-        ) {
-          window.dispatchEvent(
-            new CustomEvent('ld2:toast', {
-              detail: {
-                title: '点赞已受限',
-                desc: `下次 ${formatLocalDateTime(nextAt)}`,
-              },
-            })
-          )
-        }
+        const desc =
+          retryAfterMs != null
+            ? `建议至少等待 ${Math.ceil(retryAfterMs / 1000)} 秒后再手动开启`
+            : '请稍后手动重新开启自动点赞'
+        window.dispatchEvent(
+          new CustomEvent('ld2:toast', {
+            detail: {
+              title: '自动点赞已停止',
+              desc,
+            },
+          })
+        )
       }
 
       function handleLikeFailed(cfg: AutoReadConfig): void {
+        const failed = pendingAutoLike
         clearPendingAutoLike()
-        if (likePlannedTopicId != null) {
-          likeTriggerAtMs = Date.now() + randInt(1800, 4000)
+        if (failed?.topicId != null && likePlannedTopicId === failed.topicId) {
+          markAutoLikePostHandled(failed.postId)
+          likeTriggerAtMs = Date.now() + 800
+          likeTriggerMinRenderedPosts = 0
         }
         refreshLikeInfo(cfg)
+        if (failed?.topicId != null && ctx.discourse.getRouteInfo().topicId === failed.topicId && state === 'running') {
+          requestTick()
+        }
       }
 
       function bodyToLowerString(body: unknown): string {
@@ -1867,9 +1805,9 @@ export function autoReadFeature(): Feature {
             }
           }
 
+          tryAutoLike(cfg, postCount)
           if (!isAtBottom()) {
             waitMoreStartedAt = 0
-            tryAutoLike(cfg, postCount)
             const step = randInt(cfg.stepMin, cfg.stepMax)
             window.scrollBy(0, step)
             scheduleTick(randInt(cfg.delayMinMs, cfg.delayMaxMs))
@@ -2026,6 +1964,7 @@ export function autoReadFeature(): Feature {
 
       const routeSub = ctx.router.onChange(() => {
         refreshLikeInfo(readConfig())
+        renderRuntimeInfo()
         if (state === 'idle') {
           disconnectTopicDomObserver()
           invalidateTopicDomSnapshot()
@@ -2071,8 +2010,6 @@ export function autoReadFeature(): Feature {
       const syncLikeAdvanced = () => {
         const enabled = likeCb.checked
         likeProbabilityInput.disabled = !enabled
-        likeDailyLimitInput.disabled = !enabled
-        likeLimitPerTopicCb.disabled = !enabled
       }
 
       const onLikeToggle = () => {
@@ -2081,8 +2018,10 @@ export function autoReadFeature(): Feature {
         cfg.autoLikeEnabled = likeCb.checked
         writeConfig(cfg)
         if (!wasEnabled && cfg.autoLikeEnabled) {
+          autoLikeStoppedReason = null
           rearmCurrentTopicAutoLike(cfg)
         } else if (!cfg.autoLikeEnabled) {
+          autoLikeStoppedReason = null
           clearAutoLikePlan()
         }
         syncLikeAdvanced()
@@ -2093,8 +2032,6 @@ export function autoReadFeature(): Feature {
       const onCfgChanged = () => {
         const cfg = readConfig()
         const prevLikeProbability = cfg.autoLikeProbability
-        const prevLikeDailyLimit = cfg.autoLikeDailyLimit
-        const prevLikeLimitPerTopic = cfg.autoLikeLimitPerTopic
         cfg.stepMin = Number.parseInt(stepMinInput.value, 10) || cfg.stepMin
         cfg.stepMax = Number.parseInt(stepMaxInput.value, 10) || cfg.stepMax
         cfg.delayMinMs = Number.parseInt(delayMinInput.value, 10) || cfg.delayMinMs
@@ -2137,17 +2074,11 @@ export function autoReadFeature(): Feature {
           const v = Number.parseFloat(likeProbabilityInput.value)
           if (Number.isFinite(v)) cfg.autoLikeProbability = v
         }
-        {
-          const v = Number.parseInt(likeDailyLimitInput.value, 10)
-          if (Number.isFinite(v)) cfg.autoLikeDailyLimit = v
-        }
-        cfg.autoLikeLimitPerTopic = likeLimitPerTopicCb.checked
         writeConfig(cfg)
         if (
           cfg.autoLikeEnabled &&
-          (prevLikeProbability !== cfg.autoLikeProbability ||
-            prevLikeDailyLimit !== cfg.autoLikeDailyLimit ||
-            prevLikeLimitPerTopic !== cfg.autoLikeLimitPerTopic)
+          !autoLikeStoppedReason &&
+          prevLikeProbability !== cfg.autoLikeProbability
         ) {
           rearmCurrentTopicAutoLike(cfg)
           return
@@ -2169,31 +2100,31 @@ export function autoReadFeature(): Feature {
       bottomPauseMinInput.addEventListener('change', onCfgChanged)
       bottomPauseMaxInput.addEventListener('change', onCfgChanged)
       likeProbabilityInput.addEventListener('change', onCfgChanged)
-      likeDailyLimitInput.addEventListener('change', onCfgChanged)
-      likeLimitPerTopicCb.addEventListener('change', onCfgChanged)
 
-      const cfg0 = readConfig()
-      likeCb.checked = cfg0.autoLikeEnabled
-      stepMinInput.value = String(cfg0.stepMin)
-      stepMaxInput.value = String(cfg0.stepMax)
-      delayMinInput.value = String(cfg0.delayMinMs)
-      delayMaxInput.value = String(cfg0.delayMaxMs)
-      userActivityPauseInput.value = String(cfg0.userActivityPauseMs)
-      continueWhenHiddenCb.checked = cfg0.continueWhenHidden
-      commentLimitInput.value = String(cfg0.commentLimit)
-      topicListLimitInput.value = String(cfg0.topicListLimit)
-      queueThrottleMinInput.value = String(cfg0.queueThrottleMinMs)
-      queueThrottleMaxInput.value = String(cfg0.queueThrottleMaxMs)
-      fallbackTopicInput.value = cfg0.fallbackTopicUrl
-      minStayInput.value = String(cfg0.minTopicStayMs)
-      bottomPauseMinInput.value = String(cfg0.bottomPauseMinMs)
-      bottomPauseMaxInput.value = String(cfg0.bottomPauseMaxMs)
-      likeProbabilityInput.value = String(cfg0.autoLikeProbability)
-      likeDailyLimitInput.value = String(cfg0.autoLikeDailyLimit)
-      likeLimitPerTopicCb.checked = cfg0.autoLikeLimitPerTopic
-      syncLikeAdvanced()
-      refreshLikeInfo(cfg0)
-      renderPresetSelection(cfg0)
+      const syncConfigUiFromStore = () => {
+        const cfg = readConfig()
+        likeCb.checked = cfg.autoLikeEnabled
+        stepMinInput.value = String(cfg.stepMin)
+        stepMaxInput.value = String(cfg.stepMax)
+        delayMinInput.value = String(cfg.delayMinMs)
+        delayMaxInput.value = String(cfg.delayMaxMs)
+        userActivityPauseInput.value = String(cfg.userActivityPauseMs)
+        continueWhenHiddenCb.checked = cfg.continueWhenHidden
+        commentLimitInput.value = String(cfg.commentLimit)
+        topicListLimitInput.value = String(cfg.topicListLimit)
+        queueThrottleMinInput.value = String(cfg.queueThrottleMinMs)
+        queueThrottleMaxInput.value = String(cfg.queueThrottleMaxMs)
+        fallbackTopicInput.value = cfg.fallbackTopicUrl
+        minStayInput.value = String(cfg.minTopicStayMs)
+        bottomPauseMinInput.value = String(cfg.bottomPauseMinMs)
+        bottomPauseMaxInput.value = String(cfg.bottomPauseMaxMs)
+        likeProbabilityInput.value = String(cfg.autoLikeProbability)
+        syncLikeAdvanced()
+        refreshLikeInfo(cfg)
+        renderPresetSelection(cfg)
+        renderRuntimeInfo()
+      }
+      syncConfigUiFromStore()
 
       const likeNetSub = installLikeNetworkObserver()
 
@@ -2245,13 +2176,11 @@ export function autoReadFeature(): Feature {
           fallbackTopicInput.removeEventListener('change', onCfgChanged)
           minStayInput.removeEventListener('change', onCfgChanged)
           bottomPauseMinInput.removeEventListener('change', onCfgChanged)
-            bottomPauseMaxInput.removeEventListener('change', onCfgChanged)
-            likeProbabilityInput.removeEventListener('change', onCfgChanged)
-            likeDailyLimitInput.removeEventListener('change', onCfgChanged)
-            likeLimitPerTopicCb.removeEventListener('change', onCfgChanged)
-            controls.innerHTML = ''
-          })
-        )
+          bottomPauseMaxInput.removeEventListener('change', onCfgChanged)
+          likeProbabilityInput.removeEventListener('change', onCfgChanged)
+          controls.innerHTML = ''
+        })
+      )
       },
   }
 }

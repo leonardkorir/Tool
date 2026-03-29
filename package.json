@@ -1,6 +1,6 @@
 {
   "name": "linuxdo-tool-v2",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "private": true,
   "description": "Userscript for linux.do and Discourse forums with export, filtering, and auto-read tools.",
   "author": "MoMo",
@@ -19,7 +19,7 @@
     "build": "BUILD=prod tsup && node scripts/postbuild.mjs prod",
     "size": "node scripts/check-size.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "biome lint .",
+    "lint": "biome lint src tests scripts package.json biome.json tsup.config.ts vitest.config.ts",
     "format": "biome format . --write",
     "test": "vitest run"
   },

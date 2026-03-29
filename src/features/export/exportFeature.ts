@@ -20,15 +20,8 @@ import type { Disposable } from '../../shared/disposable'
 import { toDisposable } from '../../shared/disposable'
 import { sanitizeFilename } from '../../shared/filename'
 import { startPassiveTopicPostCache, startPassiveUserActivityCache } from './domPassiveCache'
-import type { DomSnapshotMode, DomSnapshotScrollConfig } from './domSnapshot'
-import {
-  exportTopicDomSnapshot,
-  exportUserActivityDomSnapshot,
-  injectOfflineInteractions,
-  prepareTopicDomSnapshotSplit,
-} from './domSnapshot'
-import { downloadHtml } from './download'
-import type { AssetInlineMetrics, AssetPolicy } from './assetPolicy'
+import { downloadHtml, downloadJson, downloadMarkdown } from './download'
+import type { AssetInlineFailure, AssetInlineMetrics, AssetPolicy } from './assetPolicy'
 import { inlineAssets } from './assetPolicy'
 import { renderSplitIndexHtml, splitTopicData } from './splitExport'
 import { loadTopicData } from './topicSource'
@@ -36,21 +29,27 @@ import type { DomScrollConfig, TopicLoadMetrics } from './topicSource'
 import { renderCleanHtml } from './templateClean'
 import type { TopicData } from './types'
 import { collectUserActivityEntries } from './userActivity'
-import type { SnapshotInlineMetrics } from './snapshotInline'
 import { escapeHtml } from '../../shared/html'
 import { getExportProgressValue } from './status'
 import {
-  clearPendingFullExport,
-  ensureTopicAtFirstPost,
-  FULL_EXPORT_RESUME_MAX_ATTEMPTS,
-  FULL_EXPORT_RESUME_TTL_MS,
-  readPendingFullExport,
-} from './fullExportResume'
+  buildTopicExportJson,
+  renderTopicMarkdown,
+  type ExportFileFormat,
+} from './structured'
 
 const FEATURE_ID = 'ld2-export'
 
-type ExportTemplate = 'clean' | 'snapshot'
 type ExportPreset = 'current' | 'full'
+
+function getEffectiveExportFormat(raw: string | ExportFileFormat): ExportFileFormat {
+  return raw === 'markdown' || raw === 'json' ? raw : 'html'
+}
+
+function formatExportLabel(format: ExportFileFormat): string {
+  if (format === 'markdown') return 'Markdown'
+  if (format === 'json') return 'JSON'
+  return 'HTML'
+}
 
 function setText(id: string, text: string): void {
   const el = document.getElementById(id)
@@ -134,17 +133,7 @@ function computeAdaptiveSplitSize(data: TopicData, baseSize: number): number {
 }
 
 function applyOfflineInteractions(html: string): string {
-  try {
-    const doc = new DOMParser().parseFromString(html, 'text/html')
-    injectOfflineInteractions(doc.documentElement)
-    // Guard: if injection fails for some reason, fall back to original HTML rather than producing a broken file.
-    if (!doc.getElementById('ld2-offline-script') || !doc.getElementById('ld2-lightbox'))
-      return html
-    // DOMParser drops the doctype; add one back for clean standalone files.
-    return `<!doctype html>\n${doc.documentElement.outerHTML}`
-  } catch {
-    return html
-  }
+  return html
 }
 
 function formatError(err: unknown): string {
@@ -165,6 +154,64 @@ function formatError(err: unknown): string {
   return '未知错误'
 }
 
+async function downloadAssetFailureReport(options: {
+  filenameBase: string
+  exportedAt: string
+  title: string
+  sourceUrl: string
+  failures: AssetInlineFailure[]
+}): Promise<void> {
+  if (options.failures.length === 0) return
+  await downloadJson({
+    filenameBase: `${options.filenameBase}_assets-report`,
+    json: {
+      version: 1,
+      exportedAt: options.exportedAt,
+      title: options.title,
+      sourceUrl: options.sourceUrl,
+      failureCount: options.failures.length,
+      failures: options.failures,
+    },
+  })
+}
+
+async function downloadCleanExport(options: {
+  format: ExportFileFormat
+  filenameBase: string
+  data: TopicData
+  exportedAt: string
+  assetFailures: AssetInlineFailure[]
+}): Promise<void> {
+  if (options.format === 'json') {
+    await downloadJson({
+      filenameBase: options.filenameBase,
+      json: buildTopicExportJson({
+        data: options.data,
+        exportedAt: options.exportedAt,
+        assetFailures: options.assetFailures,
+      }),
+    })
+    return
+  }
+
+  if (options.format === 'markdown') {
+    await downloadMarkdown({
+      filenameBase: options.filenameBase,
+      markdown: renderTopicMarkdown({
+        data: options.data,
+        exportedAt: options.exportedAt,
+        assetFailures: options.assetFailures,
+      }),
+    })
+    return
+  }
+
+  const html = applyOfflineInteractions(
+    renderCleanHtml(options.data, { exportedAt: options.exportedAt })
+  )
+  await downloadHtml({ filenameBase: options.filenameBase, html })
+}
+
 export function exportFeature(): Feature {
   return {
     id: FEATURE_ID,
@@ -181,11 +228,12 @@ export function exportFeature(): Feature {
       configRow.className = 'stack vertical'
       configRow.style.gap = '8px'
 
-      const templateSelect = createSelect([
-        { value: 'clean', label: '简洁（数据化）' },
-        { value: 'snapshot', label: '原样（DOM 快照）' },
+      const formatSelect = createSelect([
+        { value: 'html', label: 'HTML' },
+        { value: 'markdown', label: 'Markdown' },
+        { value: 'json', label: 'JSON' },
       ])
-      templateSelect.setAttribute('aria-label', '导出模板')
+      formatSelect.setAttribute('aria-label', '导出格式')
 
       const networkDelayInput = createNumberInput({
         min: 0,
@@ -256,8 +304,8 @@ export function exportFeature(): Feature {
 
       configRow.appendChild(
         createRow({
-          title: '导出模板',
-          right: templateSelect,
+          title: '导出格式',
+          right: formatSelect,
         })
       )
       configRow.appendChild(
@@ -341,16 +389,15 @@ export function exportFeature(): Feature {
       quickActionsCard.className = 'ld2-summary-card'
 
       type ExportUiMetrics = {
-        template: ExportTemplate
+        format: ExportFileFormat
         preset: ExportPreset
         routeKind: 'topic' | 'activity'
-        snapshotMode: DomSnapshotMode | null
         splitEnabled: boolean
         splitSegments: number | null
         collected: number | null
         topicLoad: TopicLoadMetrics | null
         assetInline: AssetInlineMetrics | null
-        snapshotInline: SnapshotInlineMetrics | null
+        assetFailures: AssetInlineFailure[]
       }
 
       let lastRun: ExportUiMetrics | null = null
@@ -401,30 +448,6 @@ export function exportFeature(): Feature {
       }
 
       updateProgressFromStatus('空闲')
-
-      const sumSnapshotInlineMetrics = (
-        a: SnapshotInlineMetrics | null,
-        b: SnapshotInlineMetrics | null
-      ): SnapshotInlineMetrics | null => {
-        if (!a) return b
-        if (!b) return a
-        return {
-          cssLinksTotal: a.cssLinksTotal + b.cssLinksTotal,
-          cssLinksInlined: a.cssLinksInlined + b.cssLinksInlined,
-          cssUrlDiscovered: a.cssUrlDiscovered + b.cssUrlDiscovered,
-          cssUrlInlined: a.cssUrlInlined + b.cssUrlInlined,
-          imgTotal: a.imgTotal + b.imgTotal,
-          imgInlined: a.imgInlined + b.imgInlined,
-          fileTotal: a.fileTotal + b.fileTotal,
-          fileInlined: a.fileInlined + b.fileInlined,
-          cacheOnlyHits: a.cacheOnlyHits + b.cacheOnlyHits,
-          cacheOnlyMisses: a.cacheOnlyMisses + b.cacheOnlyMisses,
-          netOk: a.netOk + b.netOk,
-          netFail: a.netFail + b.netFail,
-          gmOk: a.gmOk + b.gmOk,
-          gmFail: a.gmFail + b.gmFail,
-        }
-      }
 
       const setMetric = (el: HTMLElement | null, text: string): void => {
         if (el) el.textContent = text
@@ -617,7 +640,6 @@ export function exportFeature(): Feature {
       scrollDetails.addEventListener('toggle', onDetailsToggle)
 
       let controller: AbortController | null = null
-      let fullExportResumeTimerId: number | null = null
 
       let passiveCacheSub: Disposable | null = null
       let passiveKind: 'topic' | 'activity' | null = null
@@ -656,7 +678,7 @@ export function exportFeature(): Feature {
         passiveUsername = null
       }
 
-      const KEY_TEMPLATE = 'export.template'
+      const KEY_FORMAT = 'export.format'
       const KEY_NETWORK_DELAY = 'export.network.delayMs'
       const KEY_INLINE_DELAY_COMPAT = 'export.inline.delayMs'
       const KEY_ASSET_POLICY = 'export.assetPolicy'
@@ -666,15 +688,15 @@ export function exportFeature(): Feature {
       const KEY_SPLIT_SIZE = 'export.split.size'
 
       function readConfig(): {
-        template: ExportTemplate
-        scrollConfig: DomScrollConfig & DomSnapshotScrollConfig
+        format: ExportFileFormat
+        scrollConfig: DomScrollConfig
         networkDelayMs: number
         assetPolicy: AssetPolicy
         cacheOnly: boolean
         splitEnabled: boolean
         splitSize: number
       } {
-        const template = String(ctx.storage.get(KEY_TEMPLATE, 'clean') || 'clean')
+        const formatRaw = String(ctx.storage.get(KEY_FORMAT, 'html') || 'html')
         const networkDelayMs = Number(
           ctx.storage.get(KEY_NETWORK_DELAY, ctx.storage.get(KEY_INLINE_DELAY_COMPAT, 800)) ?? 800
         )
@@ -700,7 +722,7 @@ export function exportFeature(): Feature {
         const scrollToTop = true
 
         return {
-          template: template === 'snapshot' ? 'snapshot' : 'clean',
+          format: getEffectiveExportFormat(formatRaw as ExportFileFormat),
           assetPolicy:
             assetPolicyRaw === 'none' || assetPolicyRaw === 'all' ? assetPolicyRaw : 'images',
           cacheOnly,
@@ -726,7 +748,7 @@ export function exportFeature(): Feature {
 
       function syncConfigUiFromStore(): void {
         const c = readConfig()
-        templateSelect.value = c.template
+        formatSelect.value = c.format
         networkDelayInput.value = String(c.networkDelayMs)
         splitCheckbox.checked = c.splitEnabled
         splitSizeInput.value = String(c.splitSize)
@@ -738,16 +760,18 @@ export function exportFeature(): Feature {
         scrollMaxCountInput.value = String(c.scrollConfig.maxScrollCount)
 
         splitSizeInput.disabled = !c.splitEnabled
+        formatSelect.disabled = false
       }
 
       function persistConfigFromUi(): void {
-        ctx.storage.set(KEY_TEMPLATE, templateSelect.value === 'snapshot' ? 'snapshot' : 'clean')
+        ctx.storage.set('export.template', 'clean')
+        ctx.storage.set(KEY_FORMAT, getEffectiveExportFormat(formatSelect.value as ExportFileFormat))
         ctx.storage.set(KEY_NETWORK_DELAY, Number.parseInt(networkDelayInput.value, 10) || 0)
 
         ctx.storage.set(KEY_SPLIT_ENABLED, splitCheckbox.checked)
         ctx.storage.set(KEY_SPLIT_SIZE, Number.parseInt(splitSizeInput.value, 10) || 500)
 
-        const scrollCfg: DomScrollConfig & DomSnapshotScrollConfig = {
+        const scrollCfg: DomScrollConfig = {
           stepPx: Number.parseInt(scrollStepInput.value, 10) || 400,
           delayMs: Number.parseInt(scrollDelayInput.value, 10) || 2500,
           stableThreshold: Number.parseInt(scrollStableInput.value, 10) || 8,
@@ -758,11 +782,13 @@ export function exportFeature(): Feature {
         ctx.storage.set(KEY_SCROLL_CFG, scrollCfg)
 
         splitSizeInput.disabled = !splitCheckbox.checked
+        formatSelect.disabled = false
       }
 
       function updateEnabled(href = window.location.href): void {
         const route = ctx.discourse.getRouteInfo(href)
         const isBusy = controller != null
+        const format = getEffectiveExportFormat(formatSelect.value as ExportFileFormat)
 
         exportCurrentBtn.disabled = !(route.isTopic || route.isUserActivity) || isBusy
         exportFullBtn.disabled = !(route.isTopic || route.isUserActivity) || isBusy
@@ -771,11 +797,12 @@ export function exportFeature(): Feature {
         actionsRow.hidden = isBusy
         stopRow.hidden = !isBusy
 
-        templateSelect.disabled = isBusy
+        formatSelect.disabled = isBusy
         networkDelayInput.disabled = isBusy
 
-        splitCheckbox.disabled = isBusy || !route.isTopic
-        splitSizeInput.disabled = isBusy || !route.isTopic || !splitCheckbox.checked
+        splitCheckbox.disabled = isBusy || !route.isTopic || format !== 'html'
+        splitSizeInput.disabled =
+          isBusy || !route.isTopic || !splitCheckbox.checked || format !== 'html'
 
         scrollStepInput.disabled = isBusy
         scrollDelayInput.disabled = isBusy
@@ -789,26 +816,30 @@ export function exportFeature(): Feature {
       function updateMetricsView(href = window.location.href): void {
         const route = ctx.discourse.getRouteInfo(href)
         const cfg = readConfig()
-        const tpl: ExportTemplate = templateSelect.value === 'snapshot' ? 'snapshot' : 'clean'
+        const format = getEffectiveExportFormat(formatSelect.value as ExportFileFormat)
 
         const pageLabel = route.isTopic
           ? `话题${route.topicId ? ` #${route.topicId}` : ''}`
           : route.isUserActivity
             ? `活动${route.username ? ` @${route.username}` : ''}`
             : '当前页面'
-        const tplLabel = tpl === 'clean' ? '简洁（数据化）' : '原样（DOM 快照）'
         const lastLabel = lastRun
-          ? `｜上次：${lastRun.preset === 'full' ? '完整' : '当前'}${lastRun.template === 'snapshot' ? '·原样' : '·简洁'}`
+          ? `｜上次：${lastRun.preset === 'full' ? '完整' : '当前'}·${formatExportLabel(lastRun.format)}`
           : ''
         setMetric(
           metricModeEl,
-          `${pageLabel}｜${tplLabel}｜资源 ${cfg.assetPolicy}｜${cfg.cacheOnly ? '仅缓存' : '可联网'}｜间隔 ${cfg.networkDelayMs}ms${lastLabel}`
+          `${pageLabel}｜简洁（数据化）｜${formatExportLabel(format)}｜资源 ${cfg.assetPolicy}｜${cfg.cacheOnly ? '仅缓存' : '可联网'}｜间隔 ${cfg.networkDelayMs}ms${lastLabel}`
         )
 
         if (!route.isTopic) {
           setMetric(metricSplitEl, '活动页不支持分段')
         } else {
-          let txt = cfg.splitEnabled ? `分段：开启（${cfg.splitSize} 楼/段）` : '分段：关闭'
+          let txt =
+            format !== 'html'
+              ? '分段：仅 HTML 导出支持'
+              : cfg.splitEnabled
+                ? `分段：开启（${cfg.splitSize} 楼/段）`
+                : '分段：关闭'
           if (lastRun?.routeKind === 'topic') {
             if (lastRun.splitSegments != null || lastRun.collected != null) {
               const seg = lastRun.splitSegments != null ? `${lastRun.splitSegments}` : '?'
@@ -821,24 +852,14 @@ export function exportFeature(): Feature {
 
         const inlineTxt = (() => {
           if (!lastRun) return '-'
-          if (lastRun.template === 'snapshot') {
-            const m = lastRun.snapshotInline
-            if (!m) return '-'
-            return `样式 ${m.cssLinksInlined}/${m.cssLinksTotal} · 图片 ${m.imgInlined}/${m.imgTotal} · 文件 ${m.fileInlined}/${m.fileTotal}`
-          }
           const m = lastRun.assetInline
           if (!m) return '-'
-          return `内联 ${m.inlined}/${m.discovered} · 失败 ${m.failed}`
+          return `内联 ${m.inlined}/${m.discovered} · 失败 ${m.failed}${lastRun.assetFailures.length > 0 ? ' · 已产出报告' : ''}`
         })()
         setMetric(metricInlineEl, inlineTxt)
 
         const cacheTxt = (() => {
           if (!lastRun) return '-'
-          if (lastRun.template === 'snapshot') {
-            const m = lastRun.snapshotInline
-            if (!m) return '-'
-            return `缓存 ${m.cacheOnlyHits} · 网络 ${m.netOk} · 脚本 ${m.gmOk}`
-          }
           if (lastRun.topicLoad) {
             const t = lastRun.topicLoad
             const dom = `${t.fromRenderedDom}`
@@ -854,47 +875,7 @@ export function exportFeature(): Feature {
         setMetric(metricCacheEl, cacheTxt)
       }
 
-      function maybeResumePendingFullExport(): void {
-        if (fullExportResumeTimerId != null) return
-        if (controller != null) return
-
-        const pending = readPendingFullExport()
-        if (!pending || !pending.topicId) return
-
-        const now = Date.now()
-        if (
-          !Number.isFinite(pending.createdAt) ||
-          now - pending.createdAt > FULL_EXPORT_RESUME_TTL_MS
-        ) {
-          clearPendingFullExport()
-          return
-        }
-
-        const route = ctx.discourse.getRouteInfo()
-        if (!route.isTopic || !route.topicId) return
-        if (String(route.topicId) !== String(pending.topicId)) return
-
-        const attempt = Number.isFinite(pending.attempt) ? pending.attempt : 1
-        if (attempt > FULL_EXPORT_RESUME_MAX_ATTEMPTS) {
-          clearPendingFullExport()
-          return
-        }
-
-        setText('ld2-export-status', '检测到待恢复的完整导出，准备继续…')
-        fullExportResumeTimerId = window.setTimeout(() => {
-          fullExportResumeTimerId = null
-          if (controller != null) return
-          const r = ctx.discourse.getRouteInfo()
-          if (!r.isTopic || !r.topicId) return
-          if (String(r.topicId) !== String(pending.topicId)) return
-          void onExport('full', { forceTemplate: 'snapshot' })
-        }, 900)
-      }
-
-      async function onExport(
-        preset: ExportPreset,
-        options: { forceTemplate?: ExportTemplate } = {}
-      ): Promise<void> {
+      async function onExport(preset: ExportPreset): Promise<void> {
         if (controller) return
         const route = ctx.discourse.getRouteInfo()
         if (!route.isTopic && !route.isUserActivity) return
@@ -909,177 +890,21 @@ export function exportFeature(): Feature {
         try {
           persistConfigFromUi()
           const config = readConfig()
-          const template: ExportTemplate = options.forceTemplate ?? config.template
+          const format = getEffectiveExportFormat(config.format)
 
           lastRun = {
-            template,
+            format,
             preset,
             routeKind: route.isUserActivity ? 'activity' : 'topic',
-            snapshotMode:
-              template === 'snapshot' ? (preset === 'full' ? 'scroll' : 'visible') : null,
             splitEnabled: !!(config.splitEnabled && route.isTopic),
             splitSegments: null,
             collected: null,
             topicLoad: null,
             assetInline: null,
-            snapshotInline: null,
+            assetFailures: [],
           }
           updateMetricsView()
 
-          if (template === 'snapshot') {
-            const mode: DomSnapshotMode = preset === 'full' ? 'scroll' : 'visible'
-            const inline = {
-              policy: config.assetPolicy,
-              delayMs: config.networkDelayMs,
-              concurrency: 4,
-              cacheOnly: config.cacheOnly,
-            }
-
-            if (route.isTopic && route.topicId) {
-              if (preset === 'full' && mode === 'scroll') {
-                const ok = await ensureTopicAtFirstPost({
-                  origin,
-                  topicId: route.topicId,
-                  slug,
-                  signal: controller.signal,
-                  onStatus: (m) => setText('ld2-export-status', m),
-                })
-                if (!ok) return
-              }
-
-              const shouldSplit = config.splitEnabled
-              if (shouldSplit) {
-                setText(
-                  'ld2-export-status',
-                  mode === 'scroll'
-                    ? 'DOM 快照分段（自动滚动收集）…'
-                    : 'DOM 快照分段（仅当前可见）…'
-                )
-
-                const exportedAt = new Date().toISOString()
-                const prepared = await prepareTopicDomSnapshotSplit({
-                  origin,
-                  topicId: route.topicId,
-                  mode,
-                  signal: controller.signal,
-                  splitSize: config.splitSize,
-                  scrollConfig: config.scrollConfig,
-                  inline,
-                  onProgress: (m) => setText('ld2-export-status', m),
-                })
-                if (prepared.segments.length === 0)
-                  throw new Error('未收集到任何楼层（可能尚未加载）')
-                if (lastRun) {
-                  lastRun.collected = prepared.collected
-                  lastRun.splitSegments = prepared.segments.length
-                  lastRun.snapshotInline = prepared.baseInlineMetrics
-                }
-                updateMetricsView()
-
-                setText('ld2-export-status', '生成目录…')
-                const indexHtml = renderSplitIndexHtml({
-                  title: document.title?.trim() || `topic_${route.topicId}`,
-                  exportedAt,
-                  origin,
-                  segments: prepared.segments,
-                })
-                setText('ld2-export-status', '下载中…(index)')
-                await downloadHtml({ filenameBase: prepared.indexFileName, html: indexHtml })
-
-                for (let i = 0; i < prepared.segments.length; i += 1) {
-                  if (controller.signal.aborted) throw new DOMException('aborted', 'AbortError')
-                  const seg = prepared.segments[i]
-                  setText('ld2-export-status', `生成中…(${i + 1}/${prepared.segments.length})`)
-                  const rendered = await prepared.renderSegment(seg, {
-                    partNo: i + 1,
-                    partTotal: prepared.segments.length,
-                  })
-                  setText('ld2-export-status', `下载中…(${i + 1}/${prepared.segments.length})`)
-                  await downloadHtml({ filenameBase: seg.fileName, html: rendered.html })
-                  if (lastRun)
-                    lastRun.snapshotInline = sumSnapshotInlineMetrics(
-                      lastRun.snapshotInline,
-                      rendered.inlineMetrics
-                    )
-                  updateMetricsView()
-                }
-
-                setText('ld2-export-status', `完成（收集 ${prepared.collected} 楼）`)
-                window.dispatchEvent(
-                  new CustomEvent('ld2:toast', {
-                    detail: {
-                      title: '导出完成',
-                      desc: `分段：${prepared.segments.length} + index`,
-                      ttlMs: 5200,
-                    },
-                  })
-                )
-                return
-              }
-
-              setText(
-                'ld2-export-status',
-                mode === 'scroll' ? 'DOM 快照（自动滚动收集）…' : 'DOM 快照（仅当前可见）…'
-              )
-              const exported = await exportTopicDomSnapshot({
-                origin,
-                topicId: route.topicId,
-                mode,
-                signal: controller.signal,
-                scrollConfig: config.scrollConfig,
-                inline,
-                onProgress: (m) => setText('ld2-export-status', m),
-              })
-              if (lastRun) {
-                lastRun.collected = exported.collected
-                lastRun.snapshotInline = exported.inlineMetrics
-              }
-              updateMetricsView()
-              setText('ld2-export-status', '下载中…')
-              await downloadHtml({ filenameBase: exported.filenameBase, html: exported.html })
-              setText('ld2-export-status', `完成（收集 ${exported.collected} 楼）`)
-              window.dispatchEvent(
-                new CustomEvent('ld2:toast', {
-                  detail: { title: '导出完成', desc: `${exported.filenameBase}.html`, ttlMs: 5200 },
-                })
-              )
-              return
-            }
-
-            if (route.isUserActivity) {
-              setText(
-                'ld2-export-status',
-                mode === 'scroll' ? '活动页快照（自动滚动收集）…' : '活动页快照（仅当前可见）…'
-              )
-              const exported = await exportUserActivityDomSnapshot({
-                origin,
-                username: route.username,
-                mode,
-                signal: controller.signal,
-                scrollConfig: config.scrollConfig,
-                inline,
-                onProgress: (m) => setText('ld2-export-status', m),
-              })
-              if (lastRun) {
-                lastRun.collected = exported.collected
-                lastRun.snapshotInline = exported.inlineMetrics
-              }
-              updateMetricsView()
-              setText('ld2-export-status', '下载中…')
-              await downloadHtml({ filenameBase: exported.filenameBase, html: exported.html })
-              setText('ld2-export-status', `完成（收集 ${exported.collected} 条）`)
-              window.dispatchEvent(
-                new CustomEvent('ld2:toast', {
-                  detail: { title: '导出完成', desc: `${exported.filenameBase}.html`, ttlMs: 5200 },
-                })
-              )
-              return
-            }
-
-            return
-          }
-
-          // clean template
           if (route.isUserActivity) {
             const exportedAt = new Date().toISOString()
             setText(
@@ -1137,14 +962,17 @@ export function exportFeature(): Feature {
             }
 
             setText('ld2-export-status', '资源内联中…')
-            const { data: inlined, metrics } = await inlineAssets(baseTopic, {
+            const { data: inlined, metrics, failures } = await inlineAssets(baseTopic, {
               policy: config.assetPolicy,
               concurrency: 3,
               delayMs: config.networkDelayMs,
               cacheOnly: config.cacheOnly,
               signal: controller.signal,
             })
-            if (lastRun) lastRun.assetInline = metrics
+            if (lastRun) {
+              lastRun.assetInline = metrics
+              lastRun.assetFailures = failures
+            }
             updateMetricsView()
             setText(
               'ld2-export-status',
@@ -1152,17 +980,32 @@ export function exportFeature(): Feature {
             )
 
             setText('ld2-export-status', '生成中…')
-            const html = applyOfflineInteractions(renderCleanHtml(inlined, { exportedAt }))
-
             const time = exportedAt.slice(0, 19).replace(/[T:]/g, '_')
             const filenameBase = sanitizeFilename(`${title}_${time}_activity`, { maxLength: 120 })
 
             setText('ld2-export-status', '下载中…')
-            await downloadHtml({ filenameBase, html })
+            await downloadCleanExport({
+              format,
+              filenameBase,
+              data: inlined,
+              exportedAt,
+              assetFailures: failures,
+            })
+            await downloadAssetFailureReport({
+              filenameBase,
+              exportedAt,
+              title,
+              sourceUrl: pageUrl,
+              failures,
+            })
             setText('ld2-export-status', `完成（收集 ${entries.length} 条）`)
             window.dispatchEvent(
               new CustomEvent('ld2:toast', {
-                detail: { title: '导出完成', desc: `${filenameBase}.html`, ttlMs: 5200 },
+                detail: {
+                  title: '导出完成',
+                  desc: `${filenameBase}.${format === 'html' ? 'html' : format === 'markdown' ? 'md' : 'json'}`,
+                  ttlMs: 5200,
+                },
               })
             )
             return
@@ -1194,14 +1037,17 @@ export function exportFeature(): Feature {
 
           const exportedAt = new Date().toISOString()
           setText('ld2-export-status', '资源内联中…')
-          const { data: finalData, metrics } = await inlineAssets(data, {
+          const { data: finalData, metrics, failures } = await inlineAssets(data, {
             policy: config.assetPolicy,
             concurrency: 3,
             delayMs: config.networkDelayMs,
             cacheOnly: config.cacheOnly,
             signal: controller.signal,
           })
-          if (lastRun) lastRun.assetInline = metrics
+          if (lastRun) {
+            lastRun.assetInline = metrics
+            lastRun.assetFailures = failures
+          }
           updateMetricsView()
           setText(
             'ld2-export-status',
@@ -1211,7 +1057,7 @@ export function exportFeature(): Feature {
           const time = exportedAt.slice(0, 19).replace(/[T:]/g, '_')
           const baseFileName = sanitizeFilename(`${finalData.topic.title}_${time}`)
 
-          const shouldSplit = config.splitEnabled
+          const shouldSplit = config.splitEnabled && format === 'html'
           if (shouldSplit) {
             const size = computeAdaptiveSplitSize(finalData, config.splitSize)
             setText('ld2-export-status', '分段生成中…')
@@ -1274,14 +1120,29 @@ export function exportFeature(): Feature {
           }
 
           setText('ld2-export-status', '生成中…')
-          const html = applyOfflineInteractions(renderCleanHtml(finalData, { exportedAt }))
-
           setText('ld2-export-status', '下载中…')
-          await downloadHtml({ filenameBase: baseFileName, html })
+          await downloadCleanExport({
+            format,
+            filenameBase: baseFileName,
+            data: finalData,
+            exportedAt,
+            assetFailures: failures,
+          })
+          await downloadAssetFailureReport({
+            filenameBase: baseFileName,
+            exportedAt,
+            title: finalData.topic.title,
+            sourceUrl: finalData.topic.url || `${finalData.topic.origin}/t/${finalData.topic.slug}/${finalData.topic.id}`,
+            failures,
+          })
           setText('ld2-export-status', '完成')
           window.dispatchEvent(
             new CustomEvent('ld2:toast', {
-              detail: { title: '导出完成', desc: `${baseFileName}.html`, ttlMs: 5200 },
+              detail: {
+                title: '导出完成',
+                desc: `${baseFileName}.${format === 'html' ? 'html' : format === 'markdown' ? 'md' : 'json'}`,
+                ttlMs: 5200,
+              },
             })
           )
         } catch (err) {
@@ -1306,7 +1167,6 @@ export function exportFeature(): Feature {
 
       function onCancel(): void {
         if (!controller) return
-        clearPendingFullExport()
         controller?.abort()
       }
 
@@ -1335,7 +1195,7 @@ export function exportFeature(): Feature {
         updateEnabled()
         updateMetricsView()
       }
-      templateSelect.addEventListener('change', onConfigChange)
+      formatSelect.addEventListener('change', onConfigChange)
       networkDelayInput.addEventListener('change', onConfigChange)
       splitCheckbox.addEventListener('change', onConfigChange)
       splitSizeInput.addEventListener('change', onConfigChange)
@@ -1349,20 +1209,18 @@ export function exportFeature(): Feature {
         syncPassiveCache(href)
         updateEnabled(href)
         updateMetricsView(href)
-        maybeResumePendingFullExport()
       })
 
       syncConfigUiFromStore()
       syncPassiveCache()
       updateEnabled()
       updateMetricsView()
-      maybeResumePendingFullExport()
 
       return toDisposable(() => {
         routeSub.dispose()
         passiveCacheSub?.dispose()
 
-        templateSelect.removeEventListener('change', onConfigChange)
+        formatSelect.removeEventListener('change', onConfigChange)
         networkDelayInput.removeEventListener('change', onConfigChange)
         splitCheckbox.removeEventListener('change', onConfigChange)
         splitSizeInput.removeEventListener('change', onConfigChange)
