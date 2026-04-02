@@ -5,7 +5,9 @@ import { DOMParser } from 'linkedom'
 import { describe, expect, it } from 'vitest'
 
 import type { DiscourseTopicJson } from '../src/platform/discourse/api'
+import { ensureOfflineAttachmentDownloads } from '../src/features/export/assetPolicy'
 import { injectOfflineInteractions } from '../src/features/export/domSnapshot'
+import { applyOfflineInteractionsToHtml } from '../src/features/export/offlineHtml'
 import { normalizeTopicData } from '../src/features/export/transform'
 import { renderCleanHtml } from '../src/features/export/templateClean'
 import { renderUserActivityCleanHtml } from '../src/features/export/templateUserActivity'
@@ -41,6 +43,23 @@ describe('offline interactions injection', () => {
     expect(doc.getElementById('ld2-offline-script')).toBeTruthy()
     expect(doc.getElementById('ld2-lightbox')).toBeTruthy()
     expect(doc.getElementById('ld2-reply-preview')).toBeTruthy()
+  })
+
+  it('applies offline interactions when exporting standalone html', () => {
+    const topicJson = loadFixture(1550278)
+    const data = normalizeTopicData({
+      origin: 'https://linux.do',
+      topicJson,
+      posts: topicJson.post_stream.posts,
+    })
+
+    const html = renderCleanHtml(data, { exportedAt: '1970-01-01T00:00:00.000Z' })
+    const withOffline = applyOfflineInteractionsToHtml(html, new DOMParser())
+
+    expect(withOffline).toContain('<!doctype html>')
+    expect(withOffline).toContain('id="ld2-offline-script"')
+    expect(withOffline).toContain('id="ld2-lightbox"')
+    expect(withOffline).toContain('id="ld2-reply-preview"')
   })
 
   it('injects required nodes into user activity export', () => {
@@ -85,5 +104,16 @@ describe('offline interactions injection', () => {
     expect(doc.querySelectorAll('#ld2-offline-script').length).toBe(1)
     expect(doc.querySelectorAll('#ld2-lightbox').length).toBe(1)
     expect(doc.querySelectorAll('#ld2-reply-preview').length).toBe(1)
+  })
+
+  it('adds download names to inlined attachment links', () => {
+    const doc = parseHtml(`<!doctype html><html><head></head><body>
+      <a class="attachment" href="data:text/plain;base64,QQ=="> 苍凉美学1.0.txt </a>
+    </body></html>`)
+
+    ensureOfflineAttachmentDownloads(doc)
+
+    const attachment = doc.querySelector('a.attachment')
+    expect(attachment?.getAttribute('download')).toBe('苍凉美学1.0.txt')
   })
 })

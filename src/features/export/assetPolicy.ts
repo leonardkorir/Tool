@@ -1,5 +1,6 @@
 import type { NormalizedPost, TopicData } from './types'
 import { gmRequest } from '../../platform/tampermonkey/http'
+import { sanitizeFilename } from '../../shared/filename'
 import { cleanUrlParamU, hasUrlParamU } from '../../shared/url'
 
 export type AssetPolicy = 'none' | 'images' | 'all'
@@ -52,6 +53,26 @@ function isAttachmentLink(a: HTMLAnchorElement): boolean {
   const cleaned = hasUrlParamU(href) ? cleanUrlParamU(href, window.location.origin) : href
   if (!isInlineableUrl(cleaned)) return false
   return isDiscourseUploadUrl(cleaned)
+}
+
+function normalizeAttachmentFilename(value: string | null | undefined): string | null {
+  const raw = String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!raw) return null
+  return sanitizeFilename(raw, { maxLength: 160 })
+}
+
+export function ensureOfflineAttachmentDownloads(root: ParentNode): void {
+  for (const a of Array.from(root.querySelectorAll<HTMLAnchorElement>('a.attachment[href], a[download][href]'))) {
+    const href = String(a.getAttribute('href') || '').trim()
+    if (!href.startsWith('data:')) continue
+    const filename =
+      normalizeAttachmentFilename(a.getAttribute('download')) ??
+      normalizeAttachmentFilename(a.textContent)
+    if (!filename) continue
+    a.setAttribute('download', filename)
+  }
 }
 
 function collectAssetUrlsFromHtml(html: string, policy: AssetPolicy): string[] {
@@ -350,6 +371,8 @@ function replaceAssetsInPost(
       if (!isAttachmentLink(a)) continue
       apply(a, 'href')
     }
+
+    ensureOfflineAttachmentDownloads(container)
   }
 
   if (policy === 'all') {

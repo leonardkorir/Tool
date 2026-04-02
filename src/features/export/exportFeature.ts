@@ -26,6 +26,7 @@ import { inlineAssets } from './assetPolicy'
 import { renderSplitIndexHtml, splitTopicData } from './splitExport'
 import { loadTopicData } from './topicSource'
 import type { DomScrollConfig, TopicLoadMetrics } from './topicSource'
+import { applyOfflineInteractionsToHtml } from './offlineHtml'
 import { renderCleanHtml } from './templateClean'
 import type { TopicData } from './types'
 import { collectUserActivityEntries } from './userActivity'
@@ -132,10 +133,6 @@ function computeAdaptiveSplitSize(data: TopicData, baseSize: number): number {
   return desired > recommended ? recommended : desired
 }
 
-function applyOfflineInteractions(html: string): string {
-  return html
-}
-
 function formatError(err: unknown): string {
   if (err instanceof DOMException && err.name === 'AbortError') return '已取消'
   if (err instanceof DiscourseApiError) {
@@ -152,27 +149,6 @@ function formatError(err: unknown): string {
   }
   if (err instanceof Error) return err.message
   return '未知错误'
-}
-
-async function downloadAssetFailureReport(options: {
-  filenameBase: string
-  exportedAt: string
-  title: string
-  sourceUrl: string
-  failures: AssetInlineFailure[]
-}): Promise<void> {
-  if (options.failures.length === 0) return
-  await downloadJson({
-    filenameBase: `${options.filenameBase}_assets-report`,
-    json: {
-      version: 1,
-      exportedAt: options.exportedAt,
-      title: options.title,
-      sourceUrl: options.sourceUrl,
-      failureCount: options.failures.length,
-      failures: options.failures,
-    },
-  })
 }
 
 async function downloadCleanExport(options: {
@@ -206,7 +182,7 @@ async function downloadCleanExport(options: {
     return
   }
 
-  const html = applyOfflineInteractions(
+  const html = applyOfflineInteractionsToHtml(
     renderCleanHtml(options.data, { exportedAt: options.exportedAt })
   )
   await downloadHtml({ filenameBase: options.filenameBase, html })
@@ -854,7 +830,7 @@ export function exportFeature(): Feature {
           if (!lastRun) return '-'
           const m = lastRun.assetInline
           if (!m) return '-'
-          return `内联 ${m.inlined}/${m.discovered} · 失败 ${m.failed}${lastRun.assetFailures.length > 0 ? ' · 已产出报告' : ''}`
+          return `内联 ${m.inlined}/${m.discovered} · 失败 ${m.failed}`
         })()
         setMetric(metricInlineEl, inlineTxt)
 
@@ -991,13 +967,6 @@ export function exportFeature(): Feature {
               exportedAt,
               assetFailures: failures,
             })
-            await downloadAssetFailureReport({
-              filenameBase,
-              exportedAt,
-              title,
-              sourceUrl: pageUrl,
-              failures,
-            })
             setText('ld2-export-status', `完成（收集 ${entries.length} 条）`)
             window.dispatchEvent(
               new CustomEvent('ld2:toast', {
@@ -1097,7 +1066,7 @@ export function exportFeature(): Feature {
                 prevFileName: segments[i - 1]?.fileName ?? null,
                 nextFileName: segments[i + 1]?.fileName ?? null,
               }
-              const html = applyOfflineInteractions(
+              const html = applyOfflineInteractionsToHtml(
                 renderCleanHtml(
                   { topic: finalData.topic, posts: seg.posts },
                   { exportedAt, linkForPostNumber: linkFor, partMeta }
@@ -1127,13 +1096,6 @@ export function exportFeature(): Feature {
             data: finalData,
             exportedAt,
             assetFailures: failures,
-          })
-          await downloadAssetFailureReport({
-            filenameBase: baseFileName,
-            exportedAt,
-            title: finalData.topic.title,
-            sourceUrl: finalData.topic.url || `${finalData.topic.origin}/t/${finalData.topic.slug}/${finalData.topic.id}`,
-            failures,
           })
           setText('ld2-export-status', '完成')
           window.dispatchEvent(
